@@ -84,6 +84,15 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
   const [pageSize, setPageSize] = useState({ w: 0, h: 0, ptsW: 0, ptsH: 0 });
   const drawingRef = useRef<InkObj | null>(null);
   const [, forceRender] = useState(0);
+  const [drag, setDrag] = useState<{
+    id: string;
+    startMouseX: number;
+    startMouseY: number;
+    startObjX: number;
+    startObjY: number;
+  } | null>(null);
+  const dragMoved = useRef(false);
+  const suppressNextClick = useRef(false);
   const [zoom, setZoom] = useState(1);
   const { ref: stageRef, scale: fitScale } = useScaledContainer(pageSize.w);
   usePinchZoom(stageRef, zoom, setZoom);
@@ -137,6 +146,42 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
     };
   }, [pdf, pageNum]);
 
+  useEffect(() => {
+    if (!drag) return;
+    function handleMove(e: PointerEvent) {
+      const overlay = overlayRef.current;
+      if (!overlay || !drag) return;
+      if (e.pointerType === "touch") e.preventDefault();
+      const r = overlay.getBoundingClientRect();
+      const sx = r.width > 0 ? pageSize.w / r.width : 1;
+      const sy = r.height > 0 ? pageSize.h / r.height : 1;
+      const x = (e.clientX - r.left) * sx;
+      const y = (e.clientY - r.top) * sy;
+      const dx = x - drag.startMouseX;
+      const dy = y - drag.startMouseY;
+      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) dragMoved.current = true;
+      setObjects((prev) =>
+        prev.map((o) =>
+          o.id === drag.id
+            ? { ...o, x: drag.startObjX + dx, y: drag.startObjY + dy }
+            : o
+        )
+      );
+    }
+    function handleUp() {
+      if (dragMoved.current) suppressNextClick.current = true;
+      setDrag(null);
+    }
+    window.addEventListener("pointermove", handleMove, { passive: false });
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [drag, pageSize.w, pageSize.h]);
+
   const visibleObjects = useMemo(
     () => objects.filter((o) => o.page === pageNum),
     [objects, pageNum]
@@ -154,7 +199,30 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
     return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
   }
 
+  function startDrag(e: React.PointerEvent, o: EditorObj) {
+    if (tool !== "select") return;
+    e.stopPropagation();
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+    setSelectedId(o.id);
+    dragMoved.current = false;
+    const r = overlay.getBoundingClientRect();
+    const sx = r.width > 0 ? pageSize.w / r.width : 1;
+    const sy = r.height > 0 ? pageSize.h / r.height : 1;
+    setDrag({
+      id: o.id,
+      startMouseX: (e.clientX - r.left) * sx,
+      startMouseY: (e.clientY - r.top) * sy,
+      startObjX: o.x,
+      startObjY: o.y,
+    });
+  }
+
   function onCanvasClick(e: React.MouseEvent) {
+    if (suppressNextClick.current) {
+      suppressNextClick.current = false;
+      return;
+    }
     if (tool === "select") {
       setSelectedId(null);
       return;
@@ -542,6 +610,7 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                 return (
                   <div
                     key={o.id}
+                    onPointerDown={(e) => startDrag(e, o)}
                     onClick={(e) => {
                       if (tool !== "select") return;
                       e.stopPropagation();
@@ -549,7 +618,8 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                     }}
                     className={cn(
                       "pointer-events-auto absolute select-none whitespace-pre font-sans",
-                      selectedId === o.id ? "outline outline-2 outline-primary" : ""
+                      tool === "select" && "cursor-move touch-none",
+                      selectedId === o.id && "outline outline-2 outline-primary"
                     )}
                     style={{
                       left: o.x,
@@ -567,6 +637,7 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                 return (
                   <div
                     key={o.id}
+                    onPointerDown={(e) => startDrag(e, o)}
                     onClick={(e) => {
                       if (tool !== "select") return;
                       e.stopPropagation();
@@ -574,7 +645,8 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                     }}
                     className={cn(
                       "pointer-events-auto absolute",
-                      selectedId === o.id ? "outline outline-2 outline-primary" : ""
+                      tool === "select" && "cursor-move touch-none",
+                      selectedId === o.id && "outline outline-2 outline-primary"
                     )}
                     style={{
                       left: o.x,
@@ -594,6 +666,8 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                     key={o.id}
                     src={o.dataUrl}
                     alt=""
+                    draggable={false}
+                    onPointerDown={(e) => startDrag(e, o)}
                     onClick={(e) => {
                       if (tool !== "select") return;
                       e.stopPropagation();
@@ -601,7 +675,8 @@ export function PdfEditor({ defaultTool = "text" }: Props) {
                     }}
                     className={cn(
                       "pointer-events-auto absolute",
-                      selectedId === o.id ? "outline outline-2 outline-primary" : ""
+                      tool === "select" && "cursor-move touch-none",
+                      selectedId === o.id && "outline outline-2 outline-primary"
                     )}
                     style={{ left: o.x, top: o.y, width: o.w, height: o.h }}
                   />
@@ -672,8 +747,6 @@ function SignaturePad({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.fillStyle = "white";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.strokeStyle = "#0f172a";
     ctx.lineWidth = 2.5;
     ctx.lineCap = "round";
@@ -727,8 +800,7 @@ function SignaturePad({
   function clear() {
     const canvas = ref.current!;
     const ctx = canvas.getContext("2d")!;
-    ctx.fillStyle = "white";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     setEmpty(true);
   }
   function confirm() {
