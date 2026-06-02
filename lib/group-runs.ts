@@ -61,6 +61,7 @@ export interface TextBlock {
   // formatting once the block is edited. When undefined, fall back to
   // text + block-level fmt fields.
   html?: string;
+  originalHtml?: string;
   isNew: boolean;
   // Soft-delete flag for source-derived blocks: hide the textarea but keep
   // the entry so we still cover the original glyphs on save.
@@ -297,6 +298,15 @@ export function groupRunsIntoBlocks(
       strikethrough,
       color: dominantColor,
       html: buildInitialHtml(text, {
+        bold,
+        italic,
+        underlined,
+        strikethrough,
+        color: dominantColor,
+        cssFontFamily: fkey ? fontFamilyMap.get(fkey) : undefined,
+        fontFamily: repFam,
+      }),
+      originalHtml: buildInitialHtml(text, {
         bold,
         italic,
         underlined,

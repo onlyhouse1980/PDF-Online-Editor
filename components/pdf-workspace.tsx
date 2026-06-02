@@ -49,6 +49,7 @@ import {
   type FontCategory,
   type FontPreset,
 } from "@/lib/font-presets";
+import { fetchGoogleFontUrls, downloadFontFile } from "@/lib/font-downloader";
 import {
   useWorkspace,
   type Overlay,
@@ -819,6 +820,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     if (b.isNew) return (b.text ?? "").trim().length > 0 || (b.html ?? "").trim().length > 0;
     if (b.text !== b.original) return true;
     if (b.html !== undefined) {
+      if (b.originalHtml !== undefined && b.html !== b.originalHtml) return true;
       const plain = htmlToPlainText(b.html);
       if (plain !== b.original) return true;
     }
@@ -858,6 +860,82 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       src.registerFontkit(fontkit);
       const out = await PDFDocument.create();
       out.registerFontkit(fontkit);
+
+      // 1. Gather all required custom Google Fonts from edited blocks
+      const requiredGoogleFonts = new Map<string, Set<string>>(); // family -> Set("style|weight")
+      for (const pdata of pages) {
+        for (const block of pdata.blocks) {
+          if (!isBlockEdited(block) || block.deleted) continue;
+          const html = block.html ?? "";
+          const plain = html ? htmlToPlainText(html) : block.text;
+          if (!plain || plain.trim().length === 0) continue;
+
+          const runs: RichRun[] = html
+            ? parseRichRuns(html, {
+                bold: !!block.bold,
+                italic: !!block.italic,
+                underlined: !!block.underlined,
+                strikethrough: !!block.strikethrough,
+                color: block.color,
+                fontFamily: block.fontFamily,
+                baseCssFontSize: block.cssFontSize,
+              })
+            : [
+                {
+                  text: block.text,
+                  bold: !!block.bold,
+                  italic: !!block.italic,
+                  underlined: !!block.underlined,
+                  strikethrough: !!block.strikethrough,
+                  color: block.color,
+                  fontFamily: block.fontFamily,
+                  fontSizeRatio: 1,
+                },
+              ];
+
+          for (const run of runs) {
+            const fam = run.fontFamily || block.fontFamily;
+            if (!fam) continue;
+            const preset = findPresetByFamily(fam);
+            if (preset && preset.google) {
+              const familyName = preset.name;
+              let fontSet = requiredGoogleFonts.get(familyName);
+              if (!fontSet) {
+                fontSet = new Set<string>();
+                requiredGoogleFonts.set(familyName, fontSet);
+              }
+              const key = `${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
+              fontSet.add(key);
+            }
+          }
+        }
+      }
+
+      // 2. Fetch stylesheet and download font files for each required Google Font
+      const customEmbeddedFontsMap = new Map<string, PDFFont>();
+      for (const [familyName, fontSet] of requiredGoogleFonts.entries()) {
+        try {
+          const rules = await fetchGoogleFontUrls(familyName);
+          for (const spec of fontSet) {
+            const [style, weightStr] = spec.split("|");
+            const weight = Number(weightStr);
+            const matchingRule = rules.find((r) => r.style === style && r.weight === weight) ||
+                                rules.find((r) => r.style === style) ||
+                                rules.find((r) => r.weight === weight) ||
+                                rules[0];
+            
+            if (matchingRule) {
+              const fontBytes = await downloadFontFile(matchingRule.url);
+              const embeddedFont = await out.embedFont(fontBytes);
+              const mapKey = `${familyName.toLowerCase()}|${style}|${weight}`;
+              customEmbeddedFontsMap.set(mapKey, embeddedFont);
+            }
+          }
+        } catch (err) {
+          console.error(`Failed to load Google Font family ${familyName}:`, err);
+        }
+      }
+
       const matcher = await buildFontMatcher(out, extracted);
       const missing = new Set<string>();
 
@@ -956,22 +1034,37 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
           }
 
           const resolveFont = (run: RichRun): PDFFont => {
-            const blockFam = (block.fontFamily ?? "").toLowerCase();
-            const runFam = (run.fontFamily ?? "").toLowerCase();
-            const sameAsPrimary = !runFam || runFam === blockFam;
-            if (
-              primary &&
-              sameAsPrimary &&
-              run.bold === !!block.bold &&
-              run.italic === !!block.italic
-            ) {
-              return primary;
+            // 1. Check if there is a preset (Google Font or standard system font) for this family
+            const targetFam = run.fontFamily || block.fontFamily;
+            if (targetFam) {
+              const preset = findPresetByFamily(targetFam);
+              if (preset) {
+                if (preset.google) {
+                  const mapKey = `${preset.name.toLowerCase()}|${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
+                  const customFont = customEmbeddedFontsMap.get(mapKey);
+                  if (customFont) {
+                    return customFont;
+                  }
+                } else {
+                  // Standard system font preset: map to standard fonts (Helvetica, Times, Courier)
+                  const isSerif = preset.category === "serif";
+                  const isMono = preset.category === "mono";
+                  return matcher.defaultFor(
+                    run.bold,
+                    run.italic,
+                    isSerif ? "serif" : isMono ? "mono" : "sans"
+                  );
+                }
+              }
             }
+
+            // 2. Fall back to standard font if no preset matches (avoid scrambled subset fonts)
+            const runFam = (run.fontFamily ?? "").toLowerCase();
             const isSerif =
               /times|garamond|serif|playfair|merriweather|lora|crimson|georgia|baskerville|palatino/.test(
-                runFam
+                runFam || (block.fontFamily ?? "")
               );
-            const isMono = /mono|courier|consolas|menlo|code/.test(runFam);
+            const isMono = /mono|courier|consolas|menlo|code/.test(runFam || (block.fontFamily ?? ""));
             return matcher.defaultFor(
               run.bold,
               run.italic,
