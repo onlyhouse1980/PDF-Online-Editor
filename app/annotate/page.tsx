@@ -1,12 +1,12 @@
 import { getTool } from "@/lib/tools";
 import { ToolShell } from "@/components/tool-shell";
-import { PdfEditor } from "@/components/pdf-editor";
+import { PdfWorkspace } from "@/components/pdf-workspace";
 
 export default function Page() {
   const tool = getTool("annotate")!;
   return (
     <ToolShell tool={tool}>
-      <PdfEditor defaultTool="highlight" />
+      <PdfWorkspace defaultTool="highlight" hint="Pick a PDF to annotate." />
     </ToolShell>
   );
 }
