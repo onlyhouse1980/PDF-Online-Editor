@@ -1,5 +1,8 @@
 "use client";
 
+import type { RunStyle } from "./style-sample";
+import { buildInitialHtml } from "./rich-text";
+
 export interface RawRun {
   str: string;
   transform: number[];
@@ -26,6 +29,7 @@ export interface SourceRun {
   pdfFontHeight: number;
   fontKey: string;
   fontFamily?: string;
+  style?: RunStyle;
 }
 
 export interface TextBlock {
@@ -34,6 +38,13 @@ export interface TextBlock {
   cssY: number;
   cssW: number;
   cssH: number;
+  // Snapshot of the initial cssX/Y/W/H at extraction time. Used to detect
+  // moves and resizes (any of the four can change) without relying on
+  // pdfCover, which is a tight glyph bbox rather than the textarea frame.
+  origCssX?: number;
+  origCssY?: number;
+  origCssW?: number;
+  origCssH?: number;
   cssFontSize: number;
   cssLineHeight: number;
   fontKey?: string;
@@ -46,9 +57,19 @@ export interface TextBlock {
   pdfLineHeight: number;
   text: string;
   original: string;
+  // Rich-text representation: contentEditable innerHTML. Source of truth for
+  // formatting once the block is edited. When undefined, fall back to
+  // text + block-level fmt fields.
+  html?: string;
   isNew: boolean;
+  // Soft-delete flag for source-derived blocks: hide the textarea but keep
+  // the entry so we still cover the original glyphs on save.
+  deleted?: boolean;
   bold?: boolean;
   italic?: boolean;
+  underlined?: boolean;
+  strikethrough?: boolean;
+  color?: { r: number; g: number; b: number };
 }
 
 interface Line {
@@ -206,15 +227,52 @@ export function groupRunsIntoBlocks(
 
     const fkLower = (fkey ?? "").toLowerCase();
     const famLower = (repFam ?? "").toLowerCase();
-    const bold = /bold|black|heavy|semibold|demi/.test(fkLower + famLower);
-    const italic = /italic|oblique/.test(fkLower + famLower);
+    const bold = /bold|black|heavy|semibold|demibold|demi(?!.*condensed)|extrabold/.test(
+      fkLower + famLower
+    );
+    const italic = /italic|oblique|slanted/.test(fkLower + famLower);
 
+    // Aggregate decoration / color across the runs that make up this block.
+    // Pick the most frequent ink color and majority-vote underline / strike.
+    let underlineVotes = 0;
+    let strikeVotes = 0;
+    const colorBuckets = new Map<string, { count: number; r: number; g: number; b: number }>();
+    for (const r of allRuns) {
+      if (!r.style) continue;
+      if (r.style.underlined) underlineVotes += 1;
+      if (r.style.strikethrough) strikeVotes += 1;
+      const cr = Math.round(r.style.color.r * 255);
+      const cg = Math.round(r.style.color.g * 255);
+      const cb = Math.round(r.style.color.b * 255);
+      const key = `${cr},${cg},${cb}`;
+      const bucket = colorBuckets.get(key);
+      if (bucket) bucket.count += r.str.length;
+      else colorBuckets.set(key, { count: r.str.length, r: cr, g: cg, b: cb });
+    }
+    let dominantColor: { r: number; g: number; b: number } | undefined;
+    let dominantCount = 0;
+    for (const e of colorBuckets.values()) {
+      if (e.count > dominantCount) {
+        dominantCount = e.count;
+        dominantColor = { r: e.r / 255, g: e.g / 255, b: e.b / 255 };
+      }
+    }
+    const halfRuns = Math.max(1, Math.ceil(allRuns.length / 2));
+    const underlined = underlineVotes >= halfRuns;
+    const strikethrough = strikeVotes >= halfRuns;
+
+    const cssW = cssRight - cssX;
+    const cssH = cssBottom - cssY;
     blocks.push({
       id: `${idPrefix}-${blocks.length + 1}`,
       cssX,
       cssY,
-      cssW: cssRight - cssX,
-      cssH: cssBottom - cssY,
+      cssW,
+      cssH,
+      origCssX: cssX,
+      origCssY: cssY,
+      origCssW: cssW,
+      origCssH: cssH,
       cssFontSize,
       cssLineHeight: lineHeight,
       fontKey: fkey,
@@ -235,6 +293,18 @@ export function groupRunsIntoBlocks(
       isNew: false,
       bold,
       italic,
+      underlined,
+      strikethrough,
+      color: dominantColor,
+      html: buildInitialHtml(text, {
+        bold,
+        italic,
+        underlined,
+        strikethrough,
+        color: dominantColor,
+        cssFontFamily: fkey ? fontFamilyMap.get(fkey) : undefined,
+        fontFamily: repFam,
+      }),
     });
   }
 

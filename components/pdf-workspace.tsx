@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PDFDocument, StandardFonts, rgb, type PDFFont } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import {
@@ -23,7 +23,6 @@ import {
 import { FileDropzone, FilePill } from "@/components/file-dropzone";
 import { Button } from "@/components/button";
 import { loadPdf } from "@/lib/pdf";
-import { type PDFDocumentProxy } from "@/lib/pdfjs";
 import { extractFont, type ExtractedFont } from "@/lib/font-extract";
 import { useScaledContainer } from "@/lib/use-scaled-container";
 import { usePinchZoom } from "@/lib/use-pinch-zoom";
@@ -34,8 +33,30 @@ import {
   type RawTextContent,
   type TextBlock,
 } from "@/lib/group-runs";
-import { wrapText } from "@/lib/text-wrap";
 import { computeSnap, type BBox } from "@/lib/snap-guides";
+import { sampleRunStyles } from "@/lib/style-sample";
+import {
+  htmlToPlainText,
+  layoutRichRuns,
+  parseRichRuns,
+  type RichRun,
+} from "@/lib/rich-text";
+import {
+  FONT_PRESETS,
+  CATEGORY_LABEL,
+  buildGoogleFontsHref,
+  findPresetByFamily,
+  type FontCategory,
+  type FontPreset,
+} from "@/lib/font-presets";
+import {
+  useWorkspace,
+  type Overlay,
+  type InkOverlay,
+  type ImageOverlay,
+  type HighlightOverlay,
+  type PageEntry,
+} from "@/components/workspace-provider";
 
 const RENDER_SCALE = 1.7;
 const DEFAULT_NEW_FONT_PT = 14;
@@ -49,52 +70,6 @@ export type WorkspaceTool =
   | "draw"
   | "image"
   | "signature";
-
-interface BaseOverlay {
-  id: string;
-  x: number;
-  y: number;
-}
-interface HighlightOverlay extends BaseOverlay {
-  type: "highlight";
-  w: number;
-  h: number;
-  color: string;
-  opacity: number;
-}
-interface InkOverlay extends BaseOverlay {
-  type: "ink";
-  points: { x: number; y: number }[];
-  color: string;
-  width: number;
-}
-interface ImageOverlay extends BaseOverlay {
-  type: "image";
-  w: number;
-  h: number;
-  dataUrl: string;
-}
-type Overlay = HighlightOverlay | InkOverlay | ImageOverlay;
-
-interface SourcePage {
-  kind: "source";
-  srcIndex: number;
-}
-interface BlankPage {
-  kind: "blank";
-}
-type PageOrigin = SourcePage | BlankPage;
-
-interface PageEntry {
-  id: string;
-  origin: PageOrigin;
-  pdfWidthPts: number;
-  pdfHeightPts: number;
-  cssWidth: number;
-  cssHeight: number;
-  blocks: TextBlock[];
-  overlays: Overlay[];
-}
 
 type FontMatch = { font: PDFFont; embeddedOriginal: boolean };
 
@@ -117,26 +92,43 @@ function nextId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
 }
 
+
 interface Props {
   defaultTool?: WorkspaceTool;
   hint?: string;
 }
 
 export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
-  const [file, setFile] = useState<File | null>(null);
-  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
-  const [pages, setPages] = useState<PageEntry[]>([]);
-  const [pageIdx, setPageIdx] = useState(0);
+  const {
+    file,
+    setFile,
+    pdf,
+    setPdf,
+    pages,
+    setPages,
+    pageIdx,
+    setPageIdx,
+    selected,
+    setSelected,
+    loading,
+    setLoading,
+    busy,
+    setBusy,
+    missingFont,
+    setMissingFont,
+    zoom,
+    setZoom,
+    color,
+    setColor,
+    strokeWidth,
+    setStrokeWidth,
+    extractedFontsRef,
+    fontFamilyMapRef,
+    pageBitmapsRef,
+    reset,
+  } = useWorkspace();
+
   const [tool, setTool] = useState<WorkspaceTool>(defaultTool);
-  const [selected, setSelected] = useState<
-    { pageIdx: number; itemId: string; kind: "block" | "overlay" } | null
-  >(null);
-  const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [missingFont, setMissingFont] = useState<string[]>([]);
-  const [zoom, setZoom] = useState(1);
-  const [color, setColor] = useState("#0f172a");
-  const [strokeWidth, setStrokeWidth] = useState(2);
   const [signatureOpen, setSignatureOpen] = useState(false);
   const [guides, setGuides] = useState<{ x: number | null; y: number | null }>({
     x: null,
@@ -145,11 +137,32 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
-  const extractedFontsRef = useRef<Map<string, ExtractedFont>>(new Map());
-  const fontFamilyMapRef = useRef<Map<string, string>>(new Map());
-  const pageBitmapsRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const [drag, setDrag] = useState<DragState | null>(null);
   const [drawing, setDrawing] = useState<InkOverlay | null>(null);
+  const focusedBlockRef = useRef<HTMLDivElement | null>(null);
+  const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+  const [formatTick, setFormatTick] = useState(0);
+
+  // Load curated Google Fonts so previews + editor render in chosen families.
+  useEffect(() => {
+    const href = buildGoogleFontsHref();
+    if (!href) return;
+    if (document.querySelector('link[data-pdfkit-google-fonts="1"]')) return;
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = href;
+    link.setAttribute("data-pdfkit-google-fonts", "1");
+    document.head.appendChild(link);
+  }, []);
+
+  // Re-check toolbar toggle state whenever the caret/selection moves.
+  useEffect(() => {
+    function onSelChange() {
+      setFormatTick((t) => (t + 1) & 0xffff);
+    }
+    document.addEventListener("selectionchange", onSelChange);
+    return () => document.removeEventListener("selectionchange", onSelChange);
+  }, []);
 
   function sanitizeFamilyName(key: string) {
     return `pdfkit-${key.replace(/[^a-zA-Z0-9]/g, "_")}`;
@@ -180,15 +193,9 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   );
 
   async function onPick(f: File) {
+    reset();
     setFile(f);
     setLoading(true);
-    setPages([]);
-    setPageIdx(0);
-    setSelected(null);
-    setMissingFont([]);
-    extractedFontsRef.current = new Map();
-    fontFamilyMapRef.current = new Map();
-    pageBitmapsRef.current = new Map();
     try {
       const doc = await loadPdf(f);
       setPdf(doc);
@@ -220,6 +227,19 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
           (e, fpt) => viewport.convertToViewportPoint(e, fpt) as [number, number],
           RENDER_SCALE
         );
+        // Sample the rendered page to recover per-run text color and detect
+        // underline/strikethrough that pdfjs doesn't expose in getTextContent.
+        if (offCtx && runs.length > 0) {
+          try {
+            const img = offCtx.getImageData(0, 0, off.width, off.height);
+            const styles = sampleRunStyles(img.data, off.width, off.height, runs);
+            runs.forEach((r, k) => {
+              r.style = styles[k];
+            });
+          } catch {
+            // getImageData can fail on tainted canvases; fall back to default styling.
+          }
+        }
         const blocks = groupRunsIntoBlocks(
           runs,
           fontFamilyMapRef.current,
@@ -356,13 +376,23 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   function deleteSelected() {
     if (!selected) return;
     setPages((prev) =>
-      prev.map((p, i) =>
-        i !== selected.pageIdx
-          ? p
-          : selected.kind === "block"
-          ? { ...p, blocks: p.blocks.filter((b) => b.id !== selected.itemId) }
-          : { ...p, overlays: p.overlays.filter((o) => o.id !== selected.itemId) }
-      )
+      prev.map((p, i) => {
+        if (i !== selected.pageIdx) return p;
+        if (selected.kind === "overlay") {
+          return { ...p, overlays: p.overlays.filter((o) => o.id !== selected.itemId) };
+        }
+        return {
+          ...p,
+          blocks: p.blocks.flatMap((b) => {
+            if (b.id !== selected.itemId) return [b];
+            // Source-derived blocks must stay in the array so save can still
+            // cover their original glyphs; mark them deleted to hide the
+            // textarea and skip drawing replacement text.
+            if (b.isNew) return [];
+            return [{ ...b, deleted: true }];
+          }),
+        };
+      })
     );
     setSelected(null);
   }
@@ -721,12 +751,22 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       monoBoldItalic: await doc.embedFont(StandardFonts.CourierBoldOblique),
     };
 
-    function fallback(ef: ExtractedFont | undefined, bold = false, italic = false): PDFFont {
+    function fallback(
+      ef: ExtractedFont | undefined,
+      bold = false,
+      italic = false,
+      categoryOverride?: "serif" | "mono" | "sans"
+    ): PDFFont {
       const family = (ef?.fontFamily ?? ef?.fontName ?? "").toLowerCase();
       const b = bold || !!ef?.bold;
       const i = italic || !!ef?.italic;
-      const isSerif = /times|georgia|serif|roman|garamond|caslon|baskerville|book/.test(family);
-      const isMono = /mono|courier|consolas|menlo|code/.test(family);
+      const isSerif =
+        categoryOverride === "serif" ||
+        (categoryOverride === undefined &&
+          /times|georgia|serif|roman|garamond|caslon|baskerville|book/.test(family));
+      const isMono =
+        categoryOverride === "mono" ||
+        (categoryOverride === undefined && /mono|courier|consolas|menlo|code/.test(family));
       if (isMono) {
         if (b && i) return std.monoBoldItalic;
         if (b) return std.monoBold;
@@ -764,19 +804,36 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       cache.set(cacheKey, out);
       return out;
     }
-    function defaultFor(bold = false, italic = false): PDFFont {
-      return fallback(undefined, bold, italic);
+    function defaultFor(
+      bold = false,
+      italic = false,
+      category?: "serif" | "mono" | "sans"
+    ): PDFFont {
+      return fallback(undefined, bold, italic, category);
     }
     return { resolveByKey, defaultFor };
   }
 
   function isBlockEdited(b: TextBlock): boolean {
-    if (b.isNew) return b.text.trim().length > 0;
+    if (b.deleted) return true;
+    if (b.isNew) return (b.text ?? "").trim().length > 0 || (b.html ?? "").trim().length > 0;
     if (b.text !== b.original) return true;
-    if (!b.pdfCover) return false;
-    const origCssX = b.pdfCover.x * RENDER_SCALE;
-    const origCssW = b.pdfCover.w * RENDER_SCALE;
-    return Math.abs(b.cssX - origCssX) > 0.5 || Math.abs(b.cssW - origCssW) > 0.5;
+    if (b.html !== undefined) {
+      const plain = htmlToPlainText(b.html);
+      if (plain !== b.original) return true;
+    }
+    if (
+      b.origCssX !== undefined &&
+      b.origCssY !== undefined &&
+      b.origCssW !== undefined &&
+      b.origCssH !== undefined
+    ) {
+      if (Math.abs(b.cssX - b.origCssX) > 0.5) return true;
+      if (Math.abs(b.cssY - b.origCssY) > 0.5) return true;
+      if (Math.abs(b.cssW - b.origCssW) > 0.5) return true;
+      if (Math.abs(b.cssH - b.origCssH) > 0.5) return true;
+    }
+    return false;
   }
 
   async function save() {
@@ -851,19 +908,10 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
               color: rgb(1, 1, 1),
             });
           }
-          const text = block.text;
-          if (!text || text.trim().length === 0) continue;
-
-          let font: PDFFont;
-          if (block.fontKey) {
-            const match = await matcher.resolveByKey(block.fontKey, block.bold, block.italic);
-            if (!match.embeddedOriginal) {
-              missing.add(block.fontFamily || block.fontKey);
-            }
-            font = match.font;
-          } else {
-            font = matcher.defaultFor(block.bold, block.italic);
-          }
+          if (block.deleted) continue;
+          const html = block.html ?? "";
+          const plain = html ? htmlToPlainText(html) : block.text;
+          if (!plain || plain.trim().length === 0) continue;
 
           const fontSizePt = block.pdfFontHeight;
           const lineHeightPt = block.pdfLineHeight;
@@ -871,27 +919,117 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
           const pdfWidthPt = Math.max(fontSizePt, block.cssW / RENDER_SCALE);
           const topPdfY = pageHeightPts - block.cssY / RENDER_SCALE;
           const firstBaselineY = topPdfY - fontSizePt * 0.85;
-          const lines = wrapText(text, font, fontSizePt, pdfWidthPt);
-          for (let i = 0; i < lines.length; i++) {
-            const ln = lines[i];
-            if (!ln) continue;
-            const y = firstBaselineY - i * lineHeightPt;
+
+          const runs: RichRun[] = html
+            ? parseRichRuns(html, {
+                bold: !!block.bold,
+                italic: !!block.italic,
+                underlined: !!block.underlined,
+                strikethrough: !!block.strikethrough,
+                color: block.color,
+                fontFamily: block.fontFamily,
+                baseCssFontSize: block.cssFontSize,
+              })
+            : [
+                {
+                  text: block.text,
+                  bold: !!block.bold,
+                  italic: !!block.italic,
+                  underlined: !!block.underlined,
+                  strikethrough: !!block.strikethrough,
+                  color: block.color,
+                  fontFamily: block.fontFamily,
+                  fontSizeRatio: 1,
+                },
+              ];
+
+          // Pre-resolve the embedded original font for runs that match the
+          // block's primary family. Other families fall back to a category-
+          // appropriate standard font (Helvetica / Times / Courier variants).
+          let primary: PDFFont | null = null;
+          if (block.fontKey) {
+            const match = await matcher.resolveByKey(block.fontKey, block.bold, block.italic);
+            if (!match.embeddedOriginal) {
+              missing.add(block.fontFamily || block.fontKey);
+            }
+            primary = match.font;
+          }
+
+          const resolveFont = (run: RichRun): PDFFont => {
+            const blockFam = (block.fontFamily ?? "").toLowerCase();
+            const runFam = (run.fontFamily ?? "").toLowerCase();
+            const sameAsPrimary = !runFam || runFam === blockFam;
+            if (
+              primary &&
+              sameAsPrimary &&
+              run.bold === !!block.bold &&
+              run.italic === !!block.italic
+            ) {
+              return primary;
+            }
+            const isSerif =
+              /times|garamond|serif|playfair|merriweather|lora|crimson|georgia|baskerville|palatino/.test(
+                runFam
+              );
+            const isMono = /mono|courier|consolas|menlo|code/.test(runFam);
+            return matcher.defaultFor(
+              run.bold,
+              run.italic,
+              isSerif ? "serif" : isMono ? "mono" : "sans"
+            );
+          };
+
+          const layout = layoutRichRuns(
+            runs,
+            pdfWidthPt,
+            fontSizePt,
+            lineHeightPt,
+            resolveFont
+          );
+          const decorationThickness = Math.max(0.4, fontSizePt * 0.06);
+          const underlineOffset = fontSizePt * 0.12;
+          const strikeOffset = fontSizePt * 0.32;
+
+          for (let li = 0; li < layout.lines.length; li++) {
+            const line = layout.lines[li];
+            const y = firstBaselineY - li * lineHeightPt;
             if (y < -fontSizePt) break;
-            try {
-              pdfPage.drawText(ln, { x: pdfXPt, y, size: fontSizePt, font, color: rgb(0, 0, 0) });
-            } catch {
-              const fb = matcher.defaultFor(block.bold, block.italic);
+            let x = pdfXPt;
+            for (const seg of line.segments) {
+              const r = seg.run;
+              const ink = r.color
+                ? rgb(r.color.r, r.color.g, r.color.b)
+                : block.color
+                ? rgb(block.color.r, block.color.g, block.color.b)
+                : rgb(0, 0, 0);
               try {
-                pdfPage.drawText(ln, {
-                  x: pdfXPt,
+                pdfPage.drawText(seg.text, {
+                  x,
                   y,
-                  size: fontSizePt,
-                  font: fb,
-                  color: rgb(0, 0, 0),
+                  size: seg.fontSizePt,
+                  font: seg.font,
+                  color: ink,
                 });
               } catch {
-                /* skip line */
+                /* glyph unsupported by this font — skip */
               }
+              if (r.underlined) {
+                pdfPage.drawLine({
+                  start: { x, y: y - underlineOffset },
+                  end: { x: x + seg.widthPt, y: y - underlineOffset },
+                  thickness: decorationThickness,
+                  color: ink,
+                });
+              }
+              if (r.strikethrough) {
+                pdfPage.drawLine({
+                  start: { x, y: y + strikeOffset },
+                  end: { x: x + seg.widthPt, y: y + strikeOffset },
+                  thickness: decorationThickness,
+                  color: ink,
+                });
+              }
+              x += seg.widthPt;
             }
           }
         }
@@ -955,6 +1093,90 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   }
 
   const current = pages[pageIdx];
+  const selectedBlock =
+    selected && selected.kind === "block"
+      ? pages[selected.pageIdx]?.blocks.find((b) => b.id === selected.itemId) ?? null
+      : null;
+  // Apply a contentEditable command to the currently focused block, then
+  // sync the resulting innerHTML back into block state.
+  function execOnFocusedBlock(
+    fn: (el: HTMLDivElement) => void
+  ): void {
+    const el = focusedBlockRef.current;
+    if (!el) return;
+    if (document.activeElement !== el) el.focus();
+    fn(el);
+    const html = el.innerHTML;
+    // Find which block this element corresponds to.
+    const id = el.getAttribute("data-block-id");
+    if (!id) return;
+    const pageIdxStr = el.getAttribute("data-page-idx");
+    const pi = pageIdxStr ? Number(pageIdxStr) : pageIdx;
+    updateBlock(pi, id, { html });
+    setFormatTick((t) => (t + 1) & 0xffff);
+  }
+  function toggleSelectedFormat(field: "bold" | "italic" | "underlined" | "strikethrough") {
+    const cmd =
+      field === "bold"
+        ? "bold"
+        : field === "italic"
+        ? "italic"
+        : field === "underlined"
+        ? "underline"
+        : "strikeThrough";
+    execOnFocusedBlock(() => {
+      try {
+        document.execCommand(cmd);
+      } catch {
+        /* no-op */
+      }
+    });
+  }
+  function setSelectedFontColor(hex: string) {
+    execOnFocusedBlock(() => {
+      try {
+        document.execCommand("foreColor", false, hex);
+      } catch {
+        /* no-op */
+      }
+    });
+  }
+  function setSelectedFontFamily(family: string) {
+    execOnFocusedBlock(() => {
+      try {
+        document.execCommand("fontName", false, family);
+      } catch {
+        /* no-op */
+      }
+    });
+  }
+  function setSelectedFontSize(sizePt: number) {
+    if (!Number.isFinite(sizePt) || sizePt < 1) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    execOnFocusedBlock(() => {
+      // execCommand("fontSize") only takes 1-7. Use insertHTML with a wrapping
+      // span at the requested px size instead.
+      const range = sel.getRangeAt(0);
+      const sizePx = sizePt * (96 / 72);
+      if (range.collapsed) return; // no selection to size
+      const span = document.createElement("span");
+      span.style.fontSize = `${sizePx}px`;
+      try {
+        range.surroundContents(span);
+      } catch {
+        // Fallback: extract + wrap (handles partially-selected nodes).
+        const frag = range.extractContents();
+        span.appendChild(frag);
+        range.insertNode(span);
+      }
+      // Keep the selection covering the resized text.
+      const newRange = document.createRange();
+      newRange.selectNodeContents(span);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+    });
+  }
   const totalChanges = pages.reduce(
     (n, p) => n + p.blocks.filter(isBlockEdited).length + p.overlays.length,
     0
@@ -972,16 +1194,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
 
   return (
     <div className="space-y-4">
-      <FilePill
-        name={file.name}
-        size={file.size}
-        onRemove={() => {
-          setFile(null);
-          setPdf(null);
-          setPages([]);
-          setSelected(null);
-        }}
-      />
+      <FilePill name={file.name} size={file.size} onRemove={reset} />
 
       {loading && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -1008,66 +1221,203 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
 
       {current && (
         <>
-          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white p-2">
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-white p-2 sm:gap-2">
             {toolList.map((t) => {
               const Icon = t.icon;
               return (
                 <button
                   key={t.key}
                   onClick={() => setTool(t.key)}
+                  title={t.label}
+                  aria-label={t.label}
                   className={cn(
-                    "inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-sm",
+                    "inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-sm sm:px-3",
                     tool === t.key ? "bg-primary text-primary-foreground" : "hover:bg-muted"
                   )}
                 >
-                  <Icon className="h-4 w-4" /> {t.label}
+                  <Icon className="h-4 w-4" />
+                  <span className="hidden sm:inline">{t.label}</span>
                 </button>
               );
             })}
-            <div className="mx-2 h-6 w-px bg-border" />
-            <label className="flex items-center gap-2 text-xs">
-              Color
+            <div className="mx-1 h-6 w-px bg-border sm:mx-2" />
+            <label className="flex items-center gap-1.5 text-xs">
+              <span className="hidden sm:inline">Color</span>
               <input
                 type="color"
                 value={color}
                 onChange={(e) => setColor(e.target.value)}
+                aria-label="Color"
                 className="h-7 w-9 rounded border border-border"
               />
             </label>
             {tool === "draw" && (
-              <label className="flex items-center gap-2 text-xs">
-                Stroke
+              <label className="flex items-center gap-1.5 text-xs">
+                <span className="hidden sm:inline">Stroke</span>
                 <input
                   type="number"
                   min={1}
                   max={20}
                   value={strokeWidth}
                   onChange={(e) => setStrokeWidth(Number(e.target.value || 1))}
-                  className="w-16 rounded-md border border-border px-2 py-1 text-xs"
+                  aria-label="Stroke width"
+                  className="w-14 rounded-md border border-border px-2 py-1 text-xs sm:w-16"
                 />
               </label>
             )}
-            <div className="ml-auto flex flex-wrap items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => addPageEntry("before")}>
-                <FilePlus2 className="h-4 w-4" /> Page before
+            <div className="mx-1 h-6 w-px bg-border sm:mx-2" />
+            {(() => {
+              const enableFormat = !!selectedBlock && !!focusedBlockId;
+              void formatTick; // re-read state on selection change
+              const q = (cmd: string) => {
+                if (!enableFormat || typeof document === "undefined") return false;
+                try {
+                  return document.queryCommandState(cmd);
+                } catch {
+                  return false;
+                }
+              };
+              let currentFontName = "";
+              if (enableFormat && typeof document !== "undefined") {
+                try {
+                  currentFontName = (document.queryCommandValue("fontName") || "")
+                    .toString()
+                    .replace(/^['"]|['"]$/g, "");
+                } catch {
+                  /* ignore */
+                }
+              }
+              return (
+                <div
+                  className="flex flex-wrap items-center gap-1"
+                  role="group"
+                  aria-label="Text formatting"
+                >
+                  <FormatToggle
+                    label="Bold"
+                    shortcut="B"
+                    active={q("bold")}
+                    disabled={!enableFormat}
+                    onClick={() => toggleSelectedFormat("bold")}
+                    className="font-bold"
+                  />
+                  <FormatToggle
+                    label="Italic"
+                    shortcut="I"
+                    active={q("italic")}
+                    disabled={!enableFormat}
+                    onClick={() => toggleSelectedFormat("italic")}
+                    className="italic"
+                  />
+                  <FormatToggle
+                    label="Underline"
+                    shortcut="U"
+                    active={q("underline")}
+                    disabled={!enableFormat}
+                    onClick={() => toggleSelectedFormat("underlined")}
+                    className="underline"
+                  />
+                  <FormatToggle
+                    label="Strikethrough"
+                    shortcut="S"
+                    active={q("strikeThrough")}
+                    disabled={!enableFormat}
+                    onClick={() => toggleSelectedFormat("strikethrough")}
+                    className="line-through"
+                  />
+                  <FontSelector
+                    currentName={currentFontName}
+                    disabled={!enableFormat}
+                    onPick={(p) => setSelectedFontFamily(p.family)}
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={400}
+                    step={0.5}
+                    defaultValue={
+                      selectedBlock
+                        ? Math.round((selectedBlock.pdfFontHeight ?? 0) * 10) / 10
+                        : ""
+                    }
+                    key={selected ? `${selected.itemId}` : "none"}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const n = Number((e.target as HTMLInputElement).value);
+                        if (Number.isFinite(n)) setSelectedFontSize(n);
+                      }
+                    }}
+                    onBlur={(e) => {
+                      const n = Number(e.target.value);
+                      if (Number.isFinite(n)) setSelectedFontSize(n);
+                    }}
+                    disabled={!enableFormat}
+                    title="Font size (pt) — applies to selected text"
+                    aria-label="Font size in points"
+                    placeholder="pt"
+                    className="ml-1 h-8 w-14 rounded-md border border-border bg-white px-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                  <input
+                    type="color"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onChange={(e) => setSelectedFontColor(e.target.value)}
+                    disabled={!enableFormat}
+                    title="Font color — applies to selected text"
+                    aria-label="Font color"
+                    className="h-8 w-9 rounded-md border border-border disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </div>
+              );
+            })()}
+            <div className="ml-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => addPageEntry("before")}
+                title="Insert blank page before this one"
+                aria-label="Insert page before"
+              >
+                <FilePlus2 className="h-4 w-4" />
+                <span className="hidden sm:inline">Page before</span>
               </Button>
-              <Button size="sm" variant="outline" onClick={() => addPageEntry("after")}>
-                <FilePlus2 className="h-4 w-4" /> Page after
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => addPageEntry("after")}
+                title="Insert blank page after this one"
+                aria-label="Insert page after"
+              >
+                <FilePlus2 className="h-4 w-4" />
+                <span className="hidden sm:inline">Page after</span>
               </Button>
               <Button
                 size="sm"
                 variant="outline"
                 onClick={deletePageEntry}
                 disabled={pages.length <= 1}
+                title="Delete current page"
+                aria-label="Delete current page"
               >
-                <Trash2 className="h-4 w-4" /> Delete page
+                <Trash2 className="h-4 w-4" />
+                <span className="hidden sm:inline">Delete page</span>
               </Button>
-              <Button size="sm" variant="outline" onClick={deleteSelected} disabled={!selected}>
-                <Trash2 className="h-4 w-4" /> Delete item
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={deleteSelected}
+                disabled={!selected}
+                title="Delete selected item"
+                aria-label="Delete selected item"
+              >
+                <Trash2 className="h-4 w-4" />
+                <span className="hidden sm:inline">Delete item</span>
               </Button>
-              <Button size="sm" onClick={save} disabled={busy}>
+              <Button size="sm" onClick={save} disabled={busy} title="Save PDF" aria-label="Save PDF">
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                Save PDF
+                <span>Save</span>
+                <span className="hidden sm:inline"> PDF</span>
               </Button>
             </div>
           </div>
@@ -1125,7 +1475,8 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
             </div>
             <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
             <span className="hidden text-sm text-muted-foreground sm:inline">
-              {current.blocks.length} block{current.blocks.length === 1 ? "" : "s"} ·{" "}
+              {current.blocks.filter((b) => !b.deleted).length} block
+              {current.blocks.filter((b) => !b.deleted).length === 1 ? "" : "s"} ·{" "}
               {current.overlays.length} overlay{current.overlays.length === 1 ? "" : "s"} ·{" "}
               {totalChanges} change{totalChanges === 1 ? "" : "s"}
             </span>
@@ -1155,6 +1506,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
               style={{ width: current.cssWidth, height: current.cssHeight }}
             >
               {current.blocks.map((b) => {
+                if (b.deleted) return null;
                 const isSelected =
                   selected?.pageIdx === pageIdx &&
                   selected.kind === "block" &&
@@ -1163,14 +1515,21 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
                   <BlockEditor
                     key={b.id}
                     block={b}
+                    pageIdx={pageIdx}
                     tool={tool}
                     selected={isSelected}
                     edited={isBlockEdited(b)}
-                    onTextChange={(v) => updateBlock(pageIdx, b.id, { text: v })}
+                    onHtmlChange={(html) =>
+                      updateBlock(pageIdx, b.id, { html, text: htmlToPlainText(html) })
+                    }
                     onSelect={() =>
                       setSelected({ pageIdx, itemId: b.id, kind: "block" })
                     }
                     onStartDrag={(e, mode) => startDrag(e, b.id, "block", mode)}
+                    registerFocused={(el) => {
+                      focusedBlockRef.current = el;
+                      setFocusedBlockId(el ? b.id : null);
+                    }}
                   />
                 );
               })}
@@ -1258,6 +1617,140 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   );
 }
 
+function FormatToggle({
+  label,
+  shortcut,
+  active,
+  disabled,
+  onClick,
+  className,
+}: {
+  label: string;
+  shortcut: string;
+  active: boolean;
+  disabled: boolean;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      aria-label={label}
+      aria-pressed={active}
+      className={cn(
+        "inline-flex h-8 w-8 items-center justify-center rounded-md border text-sm",
+        disabled
+          ? "cursor-not-allowed border-transparent text-muted-foreground/60"
+          : active
+          ? "border-primary bg-primary text-primary-foreground"
+          : "border-border bg-white hover:bg-muted",
+        className
+      )}
+    >
+      {shortcut}
+    </button>
+  );
+}
+
+function FontSelector({
+  currentName,
+  disabled,
+  onPick,
+}: {
+  currentName: string;
+  disabled: boolean;
+  onPick: (preset: FontPreset) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const grouped = useMemoGroupedPresets();
+  const matching = currentName
+    ? findPresetByFamily(currentName)?.name ?? currentName
+    : "";
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => !disabled && setOpen((v) => !v)}
+        disabled={disabled}
+        title="Font family — applies to selected text"
+        aria-label="Font family"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className={cn(
+          "ml-1 inline-flex h-8 min-w-[7.5rem] items-center justify-between gap-1 rounded-md border bg-white px-2 text-xs",
+          disabled
+            ? "cursor-not-allowed border-transparent text-muted-foreground/60"
+            : "border-border hover:bg-muted"
+        )}
+      >
+        <span className="truncate">{matching || "Font"}</span>
+        <span aria-hidden className="ml-1">▾</span>
+      </button>
+      {open && !disabled && (
+        <div
+          role="listbox"
+          onMouseDown={(e) => e.preventDefault()}
+          className="absolute left-0 top-9 z-20 max-h-80 w-64 overflow-y-auto rounded-lg border border-border bg-white p-1 shadow-lg"
+        >
+          {grouped.map(([cat, items]) => (
+            <div key={cat}>
+              <div className="px-2 pt-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                {CATEGORY_LABEL[cat as FontCategory]}
+              </div>
+              {items.map((p) => (
+                <button
+                  key={p.name}
+                  type="button"
+                  role="option"
+                  aria-selected={matching === p.name}
+                  onClick={() => {
+                    onPick(p);
+                    setOpen(false);
+                  }}
+                  className={cn(
+                    "block w-full truncate rounded px-2 py-1.5 text-left text-base hover:bg-muted",
+                    matching === p.name ? "bg-primary/10 text-primary" : ""
+                  )}
+                  style={{ fontFamily: p.family }}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function useMemoGroupedPresets(): [FontCategory, FontPreset[]][] {
+  return useMemo(() => {
+    const order: FontCategory[] = ["sans", "serif", "mono", "display", "handwriting"];
+    const out: [FontCategory, FontPreset[]][] = [];
+    for (const cat of order) {
+      out.push([cat, FONT_PRESETS.filter((p) => p.category === cat)]);
+    }
+    return out;
+  }, []);
+}
+
 function overlayBBox(o: Overlay): BBox {
   if (o.type === "ink") {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -1275,22 +1768,41 @@ function overlayBBox(o: Overlay): BBox {
 
 function BlockEditor({
   block,
+  pageIdx,
   tool,
   selected,
   edited,
-  onTextChange,
+  onHtmlChange,
   onSelect,
   onStartDrag,
+  registerFocused,
 }: {
   block: TextBlock;
+  pageIdx: number;
   tool: WorkspaceTool;
   selected: boolean;
   edited: boolean;
-  onTextChange: (v: string) => void;
+  onHtmlChange: (html: string) => void;
   onSelect: () => void;
   onStartDrag: (e: React.PointerEvent, mode: "move" | "resize") => void;
+  registerFocused: (el: HTMLDivElement | null) => void;
 }) {
   const moving = tool === "move";
+  const editorRef = useRef<HTMLDivElement>(null);
+
+  // Seed the contentEditable once per block instance. The element is uncontrolled
+  // thereafter — typing/exec commands write directly into the DOM, and we sync
+  // state on input. (BlockEditor remounts when block.id changes via the key.)
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el) return;
+    const initial = block.html ?? "";
+    if (el.innerHTML !== initial) {
+      el.innerHTML = initial;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div
       onPointerDown={(e) => {
@@ -1313,18 +1825,28 @@ function BlockEditor({
         height: Math.max(block.cssH, block.cssFontSize * 1.2),
       }}
     >
-      <textarea
-        value={block.text}
+      <div
+        ref={editorRef}
+        data-block-id={block.id}
+        data-page-idx={pageIdx}
+        contentEditable={!moving}
+        suppressContentEditableWarning
         spellCheck={false}
-        readOnly={moving}
-        onFocus={onSelect}
-        onChange={(e) => onTextChange(e.target.value)}
+        onFocus={() => {
+          onSelect();
+          registerFocused(editorRef.current);
+        }}
+        onBlur={() => {
+          // Keep focused ref pointing here until another block focuses, so toolbar
+          // exec works when the user clicks a button (which itself prevents focus).
+        }}
+        onInput={(e) => onHtmlChange((e.currentTarget as HTMLDivElement).innerHTML)}
         onPointerDown={(e) => {
           if (moving) return;
           e.stopPropagation();
         }}
         className={cn(
-          "absolute inset-0 block w-full resize-none overflow-hidden border-none bg-transparent p-0 leading-tight outline-none",
+          "absolute inset-0 block w-full overflow-hidden border-none bg-transparent p-0 leading-tight outline-none",
           edited && "bg-amber-50/70",
           moving && "pointer-events-none select-none"
         )}
@@ -1332,9 +1854,11 @@ function BlockEditor({
           fontSize: block.cssFontSize,
           lineHeight: `${block.cssLineHeight}px`,
           fontFamily: block.cssFontFamily ?? block.fontFamily ?? "inherit",
-          fontWeight: block.bold ? 700 : 400,
-          fontStyle: block.italic ? "italic" : "normal",
-          color: "#0f172a",
+          color: block.color
+            ? `rgb(${Math.round(block.color.r * 255)}, ${Math.round(
+                block.color.g * 255
+              )}, ${Math.round(block.color.b * 255)})`
+            : "#0f172a",
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}
@@ -1480,7 +2004,7 @@ function ScaledPage({
     <div
       ref={outerRef}
       style={{ touchAction: "pan-x pan-y" }}
-      className="max-h-[80vh] overflow-auto overscroll-contain rounded-lg border border-border bg-slate-100 p-2 sm:p-4"
+      className="max-h-[60vh] overflow-auto overscroll-contain rounded-lg border border-border bg-slate-100 p-2 sm:max-h-[80vh] sm:p-4"
     >
       <div
         className="mx-auto"

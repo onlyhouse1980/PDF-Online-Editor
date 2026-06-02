@@ -4,6 +4,7 @@ import "./globals.css";
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { PwaRegistrar } from "@/components/pwa-registrar";
+import { WorkspaceProvider } from "@/components/workspace-provider";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -47,9 +48,11 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         <PwaRegistrar />
-        <Header />
-        <main className="flex-1">{children}</main>
-        <Footer />
+        <WorkspaceProvider>
+          <Header />
+          <main className="flex-1">{children}</main>
+          <Footer />
+        </WorkspaceProvider>
       </body>
     </html>
   );
