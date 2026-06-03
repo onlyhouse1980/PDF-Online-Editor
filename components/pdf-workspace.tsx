@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { PDFDocument, StandardFonts, rgb, type PDFFont } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import {
@@ -24,6 +24,10 @@ import {
   X,
   ZoomIn,
   ZoomOut,
+  BringToFront,
+  SendToBack,
+  WrapText,
+  AlignVerticalSpaceAround,
 } from "lucide-react";
 import { FileDropzone, FilePill } from "@/components/file-dropzone";
 import { Button } from "@/components/button";
@@ -32,6 +36,15 @@ import { extractFont, type ExtractedFont } from "@/lib/font-extract";
 import { useScaledContainer } from "@/lib/use-scaled-container";
 import { usePinchZoom } from "@/lib/use-pinch-zoom";
 import { cn, downloadBlob } from "@/lib/utils";
+import {
+  WrapInlineIcon,
+  WrapSquareIcon,
+  WrapTightIcon,
+  WrapThroughIcon,
+  WrapTopBottomIcon,
+  WrapBehindIcon,
+  WrapFrontIcon,
+} from "@/components/wrap-icons";
 import {
   extractRuns,
   groupRunsIntoBlocks,
@@ -45,7 +58,16 @@ import {
   layoutRichRuns,
   parseRichRuns,
   type RichRun,
+  type WrapZone,
 } from "@/lib/rich-text";
+import {
+  imageDrawLayer,
+  normalizeImageWrapMode,
+  toWrapZone,
+  wrapMarginForMode,
+  type ImageWrapMode,
+  type TextWrapMode,
+} from "@/lib/image-wrap";
 import {
   FONT_PRESETS,
   CATEGORY_LABEL,
@@ -90,6 +112,7 @@ interface DragState {
   startY: number;
   startW: number;
   startH: number;
+  anchoredOverlays?: { id: string; startX: number; startY: number }[];
 }
 
 let idCounter = 0;
@@ -171,7 +194,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   useEffect(() => {
     function onSelChange() {
       setFormatTick((t) => (t + 1) & 0xffff);
-      
+
       const sel = window.getSelection();
       if (!sel || sel.rangeCount === 0) return;
       const range = sel.getRangeAt(0);
@@ -353,9 +376,9 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
         i !== pIdx
           ? p
           : {
-              ...p,
-              blocks: p.blocks.map((b) => (b.id === blockId ? { ...b, ...patch } : b)),
-            }
+            ...p,
+            blocks: p.blocks.map((b) => (b.id === blockId ? { ...b, ...patch } : b)),
+          }
       )
     );
   }
@@ -366,11 +389,11 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
         i !== pIdx
           ? p
           : {
-              ...p,
-              overlays: p.overlays.map((o) =>
-                o.id === id ? ({ ...o, ...patch } as Overlay) : o
-              ),
-            }
+            ...p,
+            overlays: p.overlays.map((o) =>
+              o.id === id ? ({ ...o, ...patch } as Overlay) : o
+            ),
+          }
       )
     );
   }
@@ -409,6 +432,28 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
         if (selected.kind === "overlay") {
           return { ...p, overlays: p.overlays.filter((o) => o.id !== selected.itemId) };
         }
+        if (selected.kind === "inline-image" && selected.extra?.src) {
+          const imgSrc = selected.extra.src;
+          return {
+            ...p,
+            blocks: p.blocks.map((b) => {
+              if (b.id !== selected.itemId) return b;
+              let newHtml = b.html || b.text || "";
+              if (typeof document !== "undefined") {
+                const tempDiv = document.createElement("div");
+                tempDiv.innerHTML = newHtml;
+                const targetImg = Array.from(tempDiv.querySelectorAll("img")).find(
+                  (img) => img.getAttribute("src") === imgSrc
+                );
+                if (targetImg) {
+                  targetImg.remove();
+                  newHtml = tempDiv.innerHTML;
+                }
+              }
+              return { ...b, html: newHtml };
+            }),
+          };
+        }
         return {
           ...p,
           blocks: p.blocks.flatMap((b) => {
@@ -419,6 +464,12 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
             if (b.isNew) return [];
             return [{ ...b, deleted: true }];
           }),
+          overlays: p.overlays.filter((o) => {
+            if (o.type === "image" && o.anchorBlockId === selected.itemId) {
+              return false;
+            }
+            return true;
+          })
         };
       })
     );
@@ -471,9 +522,15 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     e.stopPropagation();
     const page = pages[pageIdx];
     let bbox: BBox | null = null;
+    let anchoredOverlays: { id: string; startX: number; startY: number }[] = [];
     if (itemKind === "block") {
       const b = page.blocks.find((x) => x.id === itemId);
-      if (b) bbox = { x: b.cssX, y: b.cssY, w: b.cssW, h: b.cssH };
+      if (b) {
+        bbox = { x: b.cssX, y: b.cssY, w: b.cssW, h: b.cssH };
+        anchoredOverlays = page.overlays
+          .filter((o): o is ImageOverlay => o.type === "image" && o.anchorBlockId === itemId)
+          .map((o) => ({ id: o.id, startX: o.x, startY: o.y }));
+      }
     } else {
       const o = page.overlays.find((x) => x.id === itemId);
       if (!o) return;
@@ -492,6 +549,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       startY: bbox.y,
       startW: bbox.w,
       startH: bbox.h,
+      anchoredOverlays,
     });
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
   }
@@ -535,6 +593,29 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
         setGuides({ x: snap.guideX, y: snap.guideY });
         if (drag.itemKind === "block") {
           updateBlock(drag.pageIdx, drag.itemId, { cssX: finalX, cssY: finalY });
+          const deltaX = finalX - drag.startX;
+          const deltaY = finalY - drag.startY;
+          if (drag.anchoredOverlays && drag.anchoredOverlays.length > 0) {
+            setPages((prev) =>
+              prev.map((p, i) => {
+                if (i !== drag.pageIdx) return p;
+                return {
+                  ...p,
+                  overlays: p.overlays.map((o) => {
+                    const start = drag.anchoredOverlays?.find((ao) => ao.id === o.id);
+                    if (start) {
+                      return {
+                        ...o,
+                        x: start.startX + deltaX,
+                        y: start.startY + deltaY,
+                      };
+                    }
+                    return o;
+                  }),
+                };
+              })
+            );
+          }
         } else {
           updateOverlayPosition(drag.pageIdx, drag.itemId, finalX, finalY);
         }
@@ -549,6 +630,26 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       }
     }
     function handleUp() {
+      if (drag && drag.itemKind === "overlay") {
+        setPages((prev) =>
+          prev.map((p, i) => {
+            if (i !== drag.pageIdx) return p;
+            return {
+              ...p,
+              overlays: p.overlays.map((o) => {
+                if (o.id === drag.itemId && o.type === "image" && o.wrapMode !== "inline") {
+                  const anchorBlockId = findClosestBlockId(p, o.x + o.w / 2, o.y + o.h / 2);
+                  return {
+                    ...o,
+                    anchorBlockId,
+                  };
+                }
+                return o;
+              }),
+            };
+          })
+        );
+      }
       setDrag(null);
       setGuides({ x: null, y: null });
     }
@@ -639,6 +740,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
           const ratio = img.height / img.width;
           const w = Math.min(maxW, img.width);
           const h = w * ratio;
+          const anchorBlockId = findClosestBlockId(page, x + w / 2, y + h / 2);
           const obj: ImageOverlay = {
             id: nextId("img"),
             type: "image",
@@ -647,6 +749,8 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
             w,
             h,
             dataUrl,
+            wrapMode: "front",
+            anchorBlockId,
           };
           setPages((prev) =>
             prev.map((p, i) =>
@@ -654,6 +758,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
             )
           );
           setSelected({ pageIdx, itemId: obj.id, kind: "overlay" });
+          setTool("move");
         };
         img.src = dataUrl;
       });
@@ -711,14 +816,19 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       const h = (img.height / img.width) * w;
       const page = pages[pageIdx];
       if (!page) return;
+      const ox = 40;
+      const oy = page.cssHeight - h - 40;
+      const anchorBlockId = findClosestBlockId(page, ox + w / 2, oy + h / 2);
       const obj: ImageOverlay = {
         id: nextId("sig"),
         type: "image",
-        x: 40,
-        y: page.cssHeight - h - 40,
+        x: ox,
+        y: oy,
         w,
         h,
         dataUrl,
+        wrapMode: "front",
+        anchorBlockId,
       };
       setPages((prev) =>
         prev.map((p, i) =>
@@ -726,6 +836,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
         )
       );
       setSelected({ pageIdx, itemId: obj.id, kind: "overlay" });
+      setTool("move");
       setSignatureOpen(false);
     };
     img.src = dataUrl;
@@ -763,6 +874,207 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, undo, redo]);
+
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (target.tagName === "IMG" && target.closest("[data-block-id]")) {
+        const blockEl = target.closest("[data-block-id]") as HTMLElement;
+        const blockId = blockEl.getAttribute("data-block-id")!;
+        const pageIdxStr = blockEl.getAttribute("data-page-idx");
+        const pi = pageIdxStr ? Number(pageIdxStr) : pageIdx;
+
+        setSelected({
+          pageIdx: pi,
+          itemId: blockId,
+          kind: "inline-image",
+          extra: { src: target.getAttribute("src") || "" }
+        });
+
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+    document.addEventListener("click", onDocClick, true);
+    return () => document.removeEventListener("click", onDocClick, true);
+  }, [pageIdx]);
+
+  const convertFloatingToInline = useCallback((pIdx: number, overlayId: string) => {
+    setPages((prev) => {
+      const page = prev[pIdx];
+      if (!page) return prev;
+      const o = page.overlays.find((x) => x.id === overlayId);
+      if (!o || o.type !== "image") return prev;
+
+      let targetBlock = page.blocks.find((b) => b.id === focusedBlockId);
+      if (!targetBlock) {
+        let minDistance = Infinity;
+        for (const b of page.blocks) {
+          if (b.deleted) continue;
+          const dx = (b.cssX + b.cssW / 2) - (o.x + o.w / 2);
+          const dy = (b.cssY + b.cssH / 2) - (o.y + o.h / 2);
+          const dist = dx * dx + dy * dy;
+          if (dist < minDistance) {
+            minDistance = dist;
+            targetBlock = b;
+          }
+        }
+      }
+
+      const imgHtml = `<img src="${o.dataUrl}" style="width: ${o.w}px; height: ${o.h}px; vertical-align: middle;" />`;
+
+      if (!targetBlock) {
+        const newBlockId = nextId("nb");
+        const newBlock: TextBlock = {
+          id: newBlockId,
+          cssX: o.x,
+          cssY: o.y,
+          cssW: Math.max(o.w, 120),
+          cssH: Math.max(o.h, 40),
+          cssFontSize: 16 * RENDER_SCALE,
+          cssLineHeight: 16 * 1.2 * RENDER_SCALE,
+          pdfX: 0,
+          pdfTopY: 0,
+          pdfFontHeight: 16,
+          pdfLineHeight: 16 * 1.2,
+          text: "",
+          html: imgHtml,
+          original: "",
+          isNew: true,
+          bold: false,
+          italic: false,
+        };
+
+        setTimeout(() => {
+          setSelected({
+            pageIdx: pIdx,
+            itemId: newBlockId,
+            kind: "inline-image",
+            extra: { src: o.dataUrl }
+          });
+        }, 0);
+
+        return prev.map((p, i) =>
+          i !== pIdx
+            ? p
+            : {
+              ...p,
+              blocks: [...p.blocks, newBlock],
+              overlays: p.overlays.filter((x) => x.id !== overlayId),
+            }
+        );
+      }
+
+      let newHtml = targetBlock.html || targetBlock.text;
+      if (focusedBlockId === targetBlock.id && focusedBlockRef.current) {
+        focusedBlockRef.current.focus();
+        try {
+          document.execCommand("insertHTML", false, imgHtml);
+          newHtml = focusedBlockRef.current.innerHTML;
+        } catch {
+          newHtml += imgHtml;
+        }
+      } else {
+        newHtml += imgHtml;
+      }
+
+      setTimeout(() => {
+        setSelected({
+          pageIdx: pIdx,
+          itemId: targetBlock!.id,
+          kind: "inline-image",
+          extra: { src: o.dataUrl }
+        });
+      }, 0);
+
+      return prev.map((p, i) =>
+        i !== pIdx
+          ? p
+          : {
+            ...p,
+            blocks: p.blocks.map((b) =>
+              b.id === targetBlock!.id ? { ...b, html: newHtml } : b
+            ),
+            overlays: p.overlays.filter((x) => x.id !== overlayId),
+          }
+      );
+    });
+  }, [focusedBlockId]);
+
+  const convertInlineToFloating = useCallback((pIdx: number, blockId: string, imgSrc: string, wrapMode: ImageWrapMode) => {
+    setPages((prev) => {
+      const page = prev[pIdx];
+      if (!page) return prev;
+      const b = page.blocks.find((x) => x.id === blockId);
+      if (!b) return prev;
+
+      const imgEl = document.querySelector(`[data-block-id="${blockId}"] img[src="${imgSrc.replace(/"/g, '\\"')}"]`) as HTMLImageElement;
+      let x = b.cssX;
+      let y = b.cssY;
+      let w = 150;
+      let h = 150;
+
+      if (imgEl && overlayRef.current) {
+        const imgRect = imgEl.getBoundingClientRect();
+        const pageRect = overlayRef.current.getBoundingClientRect();
+        const scaleX = pageRect.width > 0 ? page.cssWidth / pageRect.width : 1;
+        const scaleY = pageRect.height > 0 ? page.cssHeight / pageRect.height : 1;
+        x = (imgRect.left - pageRect.left) * scaleX;
+        y = (imgRect.top - pageRect.top) * scaleY;
+        w = imgRect.width * scaleX;
+        h = imgRect.height * scaleY;
+      }
+
+      let newHtml = b.html || "";
+      if (imgEl) {
+        imgEl.remove();
+        if (imgEl.parentElement) {
+          newHtml = imgEl.parentElement.innerHTML;
+        } else {
+          newHtml = newHtml.replace(/<img[^>]*>/i, "");
+        }
+      } else if (typeof document !== "undefined") {
+        const tempDiv = document.createElement("div");
+        tempDiv.innerHTML = newHtml;
+        const targetImg = Array.from(tempDiv.querySelectorAll("img")).find(
+          (img) => img.getAttribute("src") === imgSrc
+        );
+        if (targetImg) {
+          targetImg.remove();
+          newHtml = tempDiv.innerHTML;
+        }
+      }
+
+      const newOverlayId = nextId("img");
+      const newOverlay: ImageOverlay = {
+        id: newOverlayId,
+        type: "image",
+        x,
+        y,
+        w,
+        h,
+        dataUrl: imgSrc,
+        wrapMode,
+        anchorBlockId: blockId,
+      };
+
+      setTimeout(() => {
+        setSelected({ pageIdx: pIdx, itemId: newOverlayId, kind: "overlay" });
+      }, 0);
+
+      return prev.map((p, i) =>
+        i !== pIdx
+          ? p
+          : {
+            ...p,
+            blocks: p.blocks.map((x) =>
+              x.id === blockId ? { ...x, html: newHtml } : x
+            ),
+            overlays: [...p.overlays, newOverlay],
+          }
+      );
+    });
+  }, []);
 
   function hexToRgb(hex: string) {
     const m = /^#?([a-f0-9]{6})$/i.exec(hex.trim());
@@ -885,254 +1197,351 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       if (pdata.origin.kind !== "source") continue;
       const page = await pdf.getPage(pdata.origin.srcIndex + 1);
       for (const block of pdata.blocks) {
-          if (!block.fontKey || extracted.has(block.fontKey)) continue;
-          extracted.set(
-            block.fontKey,
-            await extractFont(pdf, page, block.fontKey, block.fontFamily)
-          );
-        }
+        if (!block.fontKey || extracted.has(block.fontKey)) continue;
+        extracted.set(
+          block.fontKey,
+          await extractFont(pdf, page, block.fontKey, block.fontFamily)
+        );
       }
-      extractedFontsRef.current = extracted;
+    }
+    extractedFontsRef.current = extracted;
 
-      const src = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
-      src.registerFontkit(fontkit);
-      const out = await PDFDocument.create();
-      out.registerFontkit(fontkit);
+    const src = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
+    src.registerFontkit(fontkit);
+    const out = await PDFDocument.create();
+    out.registerFontkit(fontkit);
 
-      // 1. Gather all required custom Google Fonts from edited blocks
-      const requiredGoogleFonts = new Map<string, Set<string>>(); // family -> Set("style|weight")
-      for (const pdata of pages) {
-        for (const block of pdata.blocks) {
-          if (!isBlockEdited(block) || block.deleted) continue;
-          const html = block.html ?? "";
-          const plain = html ? htmlToPlainText(html) : block.text;
-          if (!plain || plain.trim().length === 0) continue;
+    // 1. Gather all required custom Google Fonts from edited blocks
+    const requiredGoogleFonts = new Map<string, Set<string>>(); // family -> Set("style|weight")
+    for (const pdata of pages) {
+      for (const block of pdata.blocks) {
+        if (!isBlockEdited(block) || block.deleted) continue;
+        const html = block.html ?? "";
+        const plain = html ? htmlToPlainText(html) : block.text;
+        if (!plain || plain.trim().length === 0) continue;
 
-          const runs: RichRun[] = html
-            ? parseRichRuns(html, {
-                bold: !!block.bold,
-                italic: !!block.italic,
-                underlined: !!block.underlined,
-                strikethrough: !!block.strikethrough,
-                color: block.color,
-                fontFamily: block.fontFamily,
-                baseCssFontSize: block.cssFontSize,
-              })
-            : [
-                {
-                  text: block.text,
-                  bold: !!block.bold,
-                  italic: !!block.italic,
-                  underlined: !!block.underlined,
-                  strikethrough: !!block.strikethrough,
-                  color: block.color,
-                  fontFamily: block.fontFamily,
-                  fontSizeRatio: 1,
-                },
-              ];
+        const runs: RichRun[] = html
+          ? parseRichRuns(html, {
+            bold: !!block.bold,
+            italic: !!block.italic,
+            underlined: !!block.underlined,
+            strikethrough: !!block.strikethrough,
+            color: block.color,
+            fontFamily: block.fontFamily,
+            baseCssFontSize: block.cssFontSize,
+          })
+          : [
+            {
+              text: block.text,
+              bold: !!block.bold,
+              italic: !!block.italic,
+              underlined: !!block.underlined,
+              strikethrough: !!block.strikethrough,
+              color: block.color,
+              fontFamily: block.fontFamily,
+              fontSizeRatio: 1,
+            },
+          ];
 
-          for (const run of runs) {
-            const fam = run.fontFamily || block.fontFamily;
-            if (!fam) continue;
-            const preset = findPresetByFamily(fam);
-            if (preset && preset.google) {
-              const familyName = preset.name;
-              let fontSet = requiredGoogleFonts.get(familyName);
-              if (!fontSet) {
-                fontSet = new Set<string>();
-                requiredGoogleFonts.set(familyName, fontSet);
-              }
-              const key = `${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
-              fontSet.add(key);
+        for (const run of runs) {
+          const fam = run.fontFamily || block.fontFamily;
+          if (!fam) continue;
+          const preset = findPresetByFamily(fam);
+          if (preset && preset.google) {
+            const familyName = preset.name;
+            let fontSet = requiredGoogleFonts.get(familyName);
+            if (!fontSet) {
+              fontSet = new Set<string>();
+              requiredGoogleFonts.set(familyName, fontSet);
             }
+            const key = `${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
+            fontSet.add(key);
           }
         }
       }
+    }
 
-      // 2. Fetch stylesheet and download font files for each required Google Font
-      const customEmbeddedFontsMap = new Map<string, PDFFont>();
-      for (const [familyName, fontSet] of requiredGoogleFonts.entries()) {
-        try {
-          const rules = await fetchGoogleFontUrls(familyName);
-          for (const spec of fontSet) {
-            const [style, weightStr] = spec.split("|");
-            const weight = Number(weightStr);
-            const matchingRule = rules.find((r) => r.style === style && r.weight === weight) ||
-                                rules.find((r) => r.style === style) ||
-                                rules.find((r) => r.weight === weight) ||
-                                rules[0];
-            
-            if (matchingRule) {
-              const fontBytes = await downloadFontFile(matchingRule.url);
-              const embeddedFont = await out.embedFont(fontBytes);
-              const mapKey = `${familyName.toLowerCase()}|${style}|${weight}`;
-              customEmbeddedFontsMap.set(mapKey, embeddedFont);
-            }
+    // 2. Fetch stylesheet and download font files for each required Google Font
+    const customEmbeddedFontsMap = new Map<string, PDFFont>();
+    for (const [familyName, fontSet] of requiredGoogleFonts.entries()) {
+      try {
+        const rules = await fetchGoogleFontUrls(familyName);
+        for (const spec of fontSet) {
+          const [style, weightStr] = spec.split("|");
+          const weight = Number(weightStr);
+          const matchingRule = rules.find((r) => r.style === style && r.weight === weight) ||
+            rules.find((r) => r.style === style) ||
+            rules.find((r) => r.weight === weight) ||
+            rules[0];
+
+          if (matchingRule) {
+            const fontBytes = await downloadFontFile(matchingRule.url);
+            const embeddedFont = await out.embedFont(fontBytes);
+            const mapKey = `${familyName.toLowerCase()}|${style}|${weight}`;
+            customEmbeddedFontsMap.set(mapKey, embeddedFont);
           }
-        } catch (err) {
-          console.error(`Failed to load Google Font family ${familyName}:`, err);
         }
+      } catch (err) {
+        console.error(`Failed to load Google Font family ${familyName}:`, err);
       }
+    }
 
-      const matcher = await buildFontMatcher(out, extracted);
-      const missing = new Set<string>();
+    const matcher = await buildFontMatcher(out, extracted);
+    const missing = new Set<string>();
 
-      const sourceIndexes = pages
-        .map((p) => (p.origin.kind === "source" ? p.origin.srcIndex : -1))
-        .filter((i) => i >= 0);
-      const uniqueSourceIndexes = Array.from(new Set(sourceIndexes));
-      const copied = uniqueSourceIndexes.length
-        ? await out.copyPages(src, uniqueSourceIndexes)
-        : [];
-      const copyMap = new Map<number, (typeof copied)[number]>();
-      uniqueSourceIndexes.forEach((srcIdx, k) => copyMap.set(srcIdx, copied[k]));
+    const sourceIndexes = pages
+      .map((p) => (p.origin.kind === "source" ? p.origin.srcIndex : -1))
+      .filter((i) => i >= 0);
+    const uniqueSourceIndexes = Array.from(new Set(sourceIndexes));
+    const copied = uniqueSourceIndexes.length
+      ? await out.copyPages(src, uniqueSourceIndexes)
+      : [];
+    const copyMap = new Map<number, (typeof copied)[number]>();
+    uniqueSourceIndexes.forEach((srcIdx, k) => copyMap.set(srcIdx, copied[k]));
 
-      const imageCache = new Map<string, Awaited<ReturnType<typeof out.embedJpg>>>();
-      async function embed(dataUrl: string) {
-        if (imageCache.has(dataUrl)) return imageCache.get(dataUrl)!;
+    const imageCache = new Map<string, Awaited<ReturnType<typeof out.embedJpg>>>();
+    async function embed(dataUrl: string) {
+      if (imageCache.has(dataUrl)) return imageCache.get(dataUrl)!;
+      try {
         const bytes = await (await fetch(dataUrl)).arrayBuffer();
         const isPng = dataUrl.startsWith("data:image/png");
         const im = isPng ? await out.embedPng(bytes) : await out.embedJpg(bytes);
         imageCache.set(dataUrl, im);
         return im;
-      }
-
-      for (const pdata of pages) {
-        let pdfPage;
-        if (pdata.origin.kind === "source") {
-          const tpl = copyMap.get(pdata.origin.srcIndex);
-          if (!tpl) continue;
-          pdfPage = out.addPage(tpl);
-        } else {
-          pdfPage = out.addPage([pdata.pdfWidthPts, pdata.pdfHeightPts]);
+      } catch (err) {
+        console.warn("Failed to embed image directly, converting to PNG...", err);
+        try {
+          const pngDataUrl = await convertImageToPng(dataUrl);
+          const bytes = await (await fetch(pngDataUrl)).arrayBuffer();
+          const im = await out.embedPng(bytes);
+          imageCache.set(dataUrl, im);
+          return im;
+        } catch (fallbackErr) {
+          console.error("Failed to embed image even after PNG conversion:", fallbackErr);
+          throw fallbackErr;
         }
-        const pageHeightPts = pdfPage.getHeight();
-        const px2pt = 1 / RENDER_SCALE;
-        const flipY = (yCss: number, heightPts = 0) =>
-          pageHeightPts - yCss * px2pt - heightPts;
+      }
+    }
 
-        // Blocks
-        for (const block of pdata.blocks) {
-          if (!isBlockEdited(block)) continue;
-          if (block.pdfCover) {
-            const pad = Math.max(1.2, block.pdfFontHeight * 0.18);
-            pdfPage.drawRectangle({
-              x: block.pdfCover.x - pad,
-              y: block.pdfCover.y - pad,
-              width: block.pdfCover.w + pad * 2,
-              height: block.pdfCover.h + pad * 2,
-              color: rgb(1, 1, 1),
+    for (const pdata of pages) {
+      let pdfPage;
+      if (pdata.origin.kind === "source") {
+        const tpl = copyMap.get(pdata.origin.srcIndex);
+        if (!tpl) continue;
+        pdfPage = out.addPage(tpl);
+      } else {
+        pdfPage = out.addPage([pdata.pdfWidthPts, pdata.pdfHeightPts]);
+      }
+      const pageHeightPts = pdfPage.getHeight();
+      const px2pt = 1 / RENDER_SCALE;
+      const flipY = (yCss: number, heightPts = 0) =>
+        pageHeightPts - yCss * px2pt - heightPts;
+
+      const drawOverlay = async (o: Overlay) => {
+        if (o.type === "highlight") {
+          const w = o.w * px2pt;
+          const h = o.h * px2pt;
+          pdfPage.drawRectangle({
+            x: o.x * px2pt,
+            y: flipY(o.y, h),
+            width: w,
+            height: h,
+            color: hexToRgb(o.color),
+            opacity: o.opacity,
+          });
+        } else if (o.type === "image") {
+          const w = o.w * px2pt;
+          const h = o.h * px2pt;
+          const im = await embed(o.dataUrl);
+          if (im) {
+            pdfPage.drawImage(im, {
+              x: o.x * px2pt,
+              y: flipY(o.y, h),
+              width: w,
+              height: h,
             });
           }
-          if (block.deleted) continue;
-          const html = block.html ?? "";
-          const plain = html ? htmlToPlainText(html) : block.text;
-          if (!plain || plain.trim().length === 0) continue;
-
-          const fontSizePt = block.pdfFontHeight;
-          const lineHeightPt = block.pdfLineHeight;
-          const pdfXPt = block.cssX / RENDER_SCALE;
-          const pdfWidthPt = Math.max(fontSizePt, block.cssW / RENDER_SCALE);
-          const topPdfY = pageHeightPts - block.cssY / RENDER_SCALE;
-          const firstBaselineY = topPdfY - fontSizePt * 0.85;
-
-          const runs: RichRun[] = html
-            ? parseRichRuns(html, {
-                bold: !!block.bold,
-                italic: !!block.italic,
-                underlined: !!block.underlined,
-                strikethrough: !!block.strikethrough,
-                color: block.color,
-                fontFamily: block.fontFamily,
-                baseCssFontSize: block.cssFontSize,
-              })
-            : [
-                {
-                  text: block.text,
-                  bold: !!block.bold,
-                  italic: !!block.italic,
-                  underlined: !!block.underlined,
-                  strikethrough: !!block.strikethrough,
-                  color: block.color,
-                  fontFamily: block.fontFamily,
-                  fontSizeRatio: 1,
-                },
-              ];
-
-          // Pre-resolve the embedded original font for runs that match the
-          // block's primary family. Other families fall back to a category-
-          // appropriate standard font (Helvetica / Times / Courier variants).
-          let primary: PDFFont | null = null;
-          if (block.fontKey) {
-            const match = await matcher.resolveByKey(block.fontKey, block.bold, block.italic);
-            if (!match.embeddedOriginal) {
-              missing.add(block.fontFamily || block.fontKey);
-            }
-            primary = match.font;
+        } else if (o.type === "ink") {
+          const pts = o.points;
+          for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1];
+            const b = pts[i];
+            pdfPage.drawLine({
+              start: { x: a.x * px2pt, y: flipY(a.y, 0) },
+              end: { x: b.x * px2pt, y: flipY(b.y, 0) },
+              thickness: o.width * px2pt,
+              color: hexToRgb(o.color),
+              opacity: 1,
+            });
           }
+        }
+      };
 
-          const resolveFont = (run: RichRun): PDFFont => {
-            // 1. Check if there is a preset (Google Font or standard system font) for this family
-            const targetFam = run.fontFamily || block.fontFamily;
-            if (targetFam) {
-              const preset = findPresetByFamily(targetFam);
-              if (preset) {
-                if (preset.google) {
-                  const mapKey = `${preset.name.toLowerCase()}|${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
-                  const customFont = customEmbeddedFontsMap.get(mapKey);
-                  if (customFont) {
-                    return customFont;
-                  }
-                } else {
-                  // Standard system font preset: map to standard fonts (Helvetica, Times, Courier)
-                  const isSerif = preset.category === "serif";
-                  const isMono = preset.category === "mono";
-                  return matcher.defaultFor(
-                    run.bold,
-                    run.italic,
-                    isSerif ? "serif" : isMono ? "mono" : "sans"
-                  );
+      // Draw non-front overlays before edited text. Front images are drawn after text.
+      for (const o of pdata.overlays) {
+        if (o.type === "image" && imageDrawLayer(o.wrapMode) === "front-text") continue;
+        await drawOverlay(o);
+      }
+
+      // Calculate wrap zones for text blocks
+      const wrapZones: WrapZone[] = [];
+      for (const o of pdata.overlays) {
+        if (o.type === "image") {
+          const zone = toWrapZone(o);
+          if (!zone) continue;
+          wrapZones.push({
+            x: zone.x / RENDER_SCALE,
+            y: pageHeightPts - zone.y / RENDER_SCALE,
+            w: zone.w / RENDER_SCALE,
+            h: zone.h / RENDER_SCALE,
+            mode: zone.mode,
+            dataUrl: zone.dataUrl,
+          });
+        }
+      }
+
+      for (const block of pdata.blocks) {
+        if (!isBlockEdited(block)) continue;
+        if (block.pdfCover) {
+          const pad = Math.max(1.2, block.pdfFontHeight * 0.18);
+          pdfPage.drawRectangle({
+            x: block.pdfCover.x - pad,
+            y: block.pdfCover.y - pad,
+            width: block.pdfCover.w + pad * 2,
+            height: block.pdfCover.h + pad * 2,
+            color: rgb(1, 1, 1),
+          });
+        }
+        if (block.deleted) continue;
+        const html = block.html ?? "";
+        const plain = html ? htmlToPlainText(html) : block.text;
+        const hasInlineImage = html ? /<img\b/i.test(html) : false;
+        if ((!plain || plain.trim().length === 0) && !hasInlineImage) continue;
+
+        const fontSizePt = block.pdfFontHeight;
+        const lineHeightPt = block.pdfLineHeight;
+        const pdfXPt = block.cssX / RENDER_SCALE;
+        const pdfWidthPt = Math.max(fontSizePt, block.cssW / RENDER_SCALE);
+        const topPdfY = pageHeightPts - block.cssY / RENDER_SCALE;
+        const firstBaselineY = topPdfY - fontSizePt * 0.85;
+
+        const runs: RichRun[] = html
+          ? parseRichRuns(html, {
+            bold: !!block.bold,
+            italic: !!block.italic,
+            underlined: !!block.underlined,
+            strikethrough: !!block.strikethrough,
+            color: block.color,
+            fontFamily: block.fontFamily,
+            baseCssFontSize: block.cssFontSize,
+            scaleRatio: RENDER_SCALE,
+          })
+          : [
+            {
+              text: block.text,
+              bold: !!block.bold,
+              italic: !!block.italic,
+              underlined: !!block.underlined,
+              strikethrough: !!block.strikethrough,
+              color: block.color,
+              fontFamily: block.fontFamily,
+              fontSizeRatio: 1,
+            },
+          ];
+
+        // Pre-resolve the embedded original font for runs that match the
+        // block's primary family. Other families fall back to a category-
+        // appropriate standard font (Helvetica / Times / Courier variants).
+        let primary: PDFFont | null = null;
+        if (block.fontKey) {
+          const match = await matcher.resolveByKey(block.fontKey, block.bold, block.italic);
+          if (!match.embeddedOriginal) {
+            missing.add(block.fontFamily || block.fontKey);
+          }
+          primary = match.font;
+        }
+
+        const resolveFont = (run: RichRun): PDFFont => {
+          // 1. Check if there is a preset (Google Font or standard system font) for this family
+          const targetFam = run.fontFamily || block.fontFamily;
+          if (targetFam) {
+            const preset = findPresetByFamily(targetFam);
+            if (preset) {
+              if (preset.google) {
+                const mapKey = `${preset.name.toLowerCase()}|${run.italic ? "italic" : "normal"}|${run.bold ? "700" : "400"}`;
+                const customFont = customEmbeddedFontsMap.get(mapKey);
+                if (customFont) {
+                  return customFont;
                 }
+              } else {
+                // Standard system font preset: map to standard fonts (Helvetica, Times, Courier)
+                const isSerif = preset.category === "serif";
+                const isMono = preset.category === "mono";
+                return matcher.defaultFor(
+                  run.bold,
+                  run.italic,
+                  isSerif ? "serif" : isMono ? "mono" : "sans"
+                );
               }
             }
+          }
 
-            // 2. Fall back to standard font if no preset matches (avoid scrambled subset fonts)
-            const runFam = (run.fontFamily ?? "").toLowerCase();
-            const isSerif =
-              /times|garamond|serif|playfair|merriweather|lora|crimson|georgia|baskerville|palatino/.test(
-                runFam || (block.fontFamily ?? "")
-              );
-            const isMono = /mono|courier|consolas|menlo|code/.test(runFam || (block.fontFamily ?? ""));
-            return matcher.defaultFor(
-              run.bold,
-              run.italic,
-              isSerif ? "serif" : isMono ? "mono" : "sans"
+          // 2. Fall back to standard font if no preset matches (avoid scrambled subset fonts)
+          const runFam = (run.fontFamily ?? "").toLowerCase();
+          const isSerif =
+            /times|garamond|serif|playfair|merriweather|lora|crimson|georgia|baskerville|palatino/.test(
+              runFam || (block.fontFamily ?? "")
             );
-          };
-
-          const layout = layoutRichRuns(
-            runs,
-            pdfWidthPt,
-            fontSizePt,
-            lineHeightPt,
-            resolveFont
+          const isMono = /mono|courier|consolas|menlo|code/.test(runFam || (block.fontFamily ?? ""));
+          return matcher.defaultFor(
+            run.bold,
+            run.italic,
+            isSerif ? "serif" : isMono ? "mono" : "sans"
           );
-          const decorationThickness = Math.max(0.4, fontSizePt * 0.06);
-          const underlineOffset = fontSizePt * 0.12;
-          const strikeOffset = fontSizePt * 0.32;
+        };
 
-          for (let li = 0; li < layout.lines.length; li++) {
-            const line = layout.lines[li];
-            const y = firstBaselineY - li * lineHeightPt;
-            if (y < -fontSizePt) break;
-            let x = pdfXPt;
-            for (const seg of line.segments) {
-              const r = seg.run;
-              const ink = r.color
-                ? rgb(r.color.r, r.color.g, r.color.b)
-                : block.color
+        // Relative wrap zones for this block
+        const blockWrapZones: WrapZone[] = wrapZones.map(z => ({
+          ...z,
+          x: z.x - pdfXPt,
+          y: topPdfY - z.y,
+        }));
+
+        const layout = layoutRichRuns(
+          runs,
+          pdfWidthPt,
+          fontSizePt,
+          lineHeightPt,
+          resolveFont,
+          blockWrapZones
+        );
+        const decorationThickness = Math.max(0.4, fontSizePt * 0.06);
+        const underlineOffset = fontSizePt * 0.12;
+        const strikeOffset = fontSizePt * 0.32;
+
+        for (let li = 0; li < layout.lines.length; li++) {
+          const line = layout.lines[li];
+          const y = topPdfY - line.topPt - line.ascentPt * 0.85;
+          if (y < -fontSizePt) break;
+          let x = pdfXPt + (line.offsetX || 0);
+          for (const seg of line.segments) {
+            const r = seg.run;
+            const ink = r.color
+              ? rgb(r.color.r, r.color.g, r.color.b)
+              : block.color
                 ? rgb(block.color.r, block.color.g, block.color.b)
                 : rgb(0, 0, 0);
+            if (r.image) {
+              const im = await embed(r.image.dataUrl);
+              if (im) {
+                pdfPage.drawImage(im, {
+                  x,
+                  y: y,
+                  width: seg.widthPt,
+                  height: seg.fontSizePt,
+                });
+              }
+            } else {
               try {
                 pdfPage.drawText(seg.text, {
                   x,
@@ -1144,69 +1553,37 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
               } catch {
                 /* glyph unsupported by this font — skip */
               }
-              if (r.underlined) {
-                pdfPage.drawLine({
-                  start: { x, y: y - underlineOffset },
-                  end: { x: x + seg.widthPt, y: y - underlineOffset },
-                  thickness: decorationThickness,
-                  color: ink,
-                });
-              }
-              if (r.strikethrough) {
-                pdfPage.drawLine({
-                  start: { x, y: y + strikeOffset },
-                  end: { x: x + seg.widthPt, y: y + strikeOffset },
-                  thickness: decorationThickness,
-                  color: ink,
-                });
-              }
-              x += seg.widthPt;
             }
-          }
-        }
-
-        // Overlays
-        for (const o of pdata.overlays) {
-          if (o.type === "highlight") {
-            const w = o.w * px2pt;
-            const h = o.h * px2pt;
-            pdfPage.drawRectangle({
-              x: o.x * px2pt,
-              y: flipY(o.y, h),
-              width: w,
-              height: h,
-              color: hexToRgb(o.color),
-              opacity: o.opacity,
-            });
-          } else if (o.type === "image") {
-            const w = o.w * px2pt;
-            const h = o.h * px2pt;
-            const im = await embed(o.dataUrl);
-            pdfPage.drawImage(im, {
-              x: o.x * px2pt,
-              y: flipY(o.y, h),
-              width: w,
-              height: h,
-            });
-          } else if (o.type === "ink") {
-            const pts = o.points;
-            for (let i = 1; i < pts.length; i++) {
-              const a = pts[i - 1];
-              const b = pts[i];
+            if (r.underlined) {
               pdfPage.drawLine({
-                start: { x: a.x * px2pt, y: flipY(a.y, 0) },
-                end: { x: b.x * px2pt, y: flipY(b.y, 0) },
-                thickness: o.width * px2pt,
-                color: hexToRgb(o.color),
-                opacity: 1,
+                start: { x, y: y - underlineOffset },
+                end: { x: x + seg.widthPt, y: y - underlineOffset },
+                thickness: decorationThickness,
+                color: ink,
               });
             }
+            if (r.strikethrough) {
+              pdfPage.drawLine({
+                start: { x, y: y + strikeOffset },
+                end: { x: x + seg.widthPt, y: y + strikeOffset },
+                thickness: decorationThickness,
+                color: ink,
+              });
+            }
+            x += seg.widthPt;
           }
         }
       }
 
-      setMissingFont(Array.from(missing));
-      return await out.save();
+      for (const o of pdata.overlays) {
+        if (o.type === "image" && imageDrawLayer(o.wrapMode) === "front-text") {
+          await drawOverlay(o);
+        }
+      }
+    }
+
+    setMissingFont(Array.from(missing));
+    return await out.save();
   }
 
   async function save() {
@@ -1231,7 +1608,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     try {
       const bytes = await generatePdfBytes();
       if (bytes) {
-        const blob = new Blob([bytes as any], { type: "application/pdf" });
+        const blob = pdfBytesToBlob(bytes);
         setPreviewUrl(URL.createObjectURL(blob));
       }
     } finally {
@@ -1246,7 +1623,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     try {
       const bytes = await generatePdfBytes();
       if (bytes) {
-        const blob = new Blob([bytes as any], { type: "application/pdf" });
+        const blob = pdfBytesToBlob(bytes);
         const url = URL.createObjectURL(blob);
         const iframe = document.createElement("iframe");
         iframe.style.display = "none";
@@ -1262,6 +1639,18 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     }
   }
 
+  const current = pages[pageIdx];
+
+  const pageWrapZones = useMemo(() => {
+    if (!current) return [];
+    return current.overlays
+      .flatMap((o) => {
+        if (o.type !== "image") return [];
+        const zone = toWrapZone(o, { margin: 0 });
+        return zone ? [zone] : [];
+      });
+  }, [current?.overlays]);
+
   if (!file) {
     return (
       <FileDropzone
@@ -1271,7 +1660,6 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     );
   }
 
-  const current = pages[pageIdx];
   const selectedBlock =
     selected && selected.kind === "block"
       ? pages[selected.pageIdx]?.blocks.find((b) => b.id === selected.itemId) ?? null
@@ -1295,14 +1683,20 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     setFormatTick((t) => (t + 1) & 0xffff);
   }
   function toggleSelectedFormat(field: "bold" | "italic" | "underlined" | "strikethrough") {
+    if (tool !== "edit-text" && selectedBlock?.id) {
+      const pIdx = selected?.pageIdx ?? 0;
+      const bField = field === "underlined" ? "underlined" : field;
+      updateBlock(pIdx, selectedBlock.id, { [bField]: !selectedBlock?.[bField] });
+      return;
+    }
     const cmd =
       field === "bold"
         ? "bold"
         : field === "italic"
-        ? "italic"
-        : field === "underlined"
-        ? "underline"
-        : "strikeThrough";
+          ? "italic"
+          : field === "underlined"
+            ? "underline"
+            : "strikeThrough";
     execOnFocusedBlock(() => {
       try {
         document.execCommand(cmd);
@@ -1312,6 +1706,12 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     });
   }
   function setSelectedFontColor(hex: string) {
+    if (tool !== "edit-text" && selectedBlock?.id) {
+      const m = /^#?([a-f0-9]{6})$/i.exec(hex.trim());
+      const rgb = m ? { r: parseInt(m[1].substring(0,2), 16) / 255, g: parseInt(m[1].substring(2,4), 16) / 255, b: parseInt(m[1].substring(4,6), 16) / 255 } : { r: 0, g: 0, b: 0 };
+      updateBlock(selected?.pageIdx ?? 0, selectedBlock.id, { color: rgb });
+      return;
+    }
     execOnFocusedBlock(() => {
       try {
         document.execCommand("foreColor", false, hex);
@@ -1321,6 +1721,10 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
     });
   }
   function setSelectedFontFamily(family: string) {
+    if (tool !== "edit-text" && selectedBlock?.id) {
+      updateBlock(selected?.pageIdx ?? 0, selectedBlock.id, { fontFamily: family });
+      return;
+    }
     execOnFocusedBlock(() => {
       try {
         document.execCommand("fontName", false, family);
@@ -1331,12 +1735,19 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   }
   function setSelectedFontSize(sizePt: number) {
     if (!Number.isFinite(sizePt) || sizePt < 1) return;
+    const sizePx = sizePt * (96 / 72);
+
+    // If not actively editing text, but we have a selected block, apply to the whole block wrapper.
+    if (tool !== "edit-text" && selectedBlock?.id) {
+      updateBlock(selected?.pageIdx ?? 0, selectedBlock.id, { cssFontSize: sizePx });
+      return;
+    }
+
     const range = lastSelectionRef.current;
     if (!range || range.collapsed) return;
     execOnFocusedBlock(() => {
       // execCommand("fontSize") only takes 1-7. Use insertHTML with a wrapping
       // span at the requested px size instead.
-      const sizePx = sizePt * (96 / 72);
       const span = document.createElement("span");
       span.style.fontSize = `${sizePx}px`;
       try {
@@ -1350,8 +1761,11 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
       // Keep the selection covering the resized text.
       const newRange = document.createRange();
       newRange.selectNodeContents(span);
-      sel.removeAllRanges();
-      sel.addRange(newRange);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(newRange);
+      lastSelectionRef.current = newRange;
+      setFormatTick((t) => (t + 1) & 0xffff);
     });
   }
   const totalChanges = pages.reduce(
@@ -1444,25 +1858,68 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
             )}
             <div className="mx-1 h-6 w-px bg-border sm:mx-2" />
             {(() => {
-              const enableFormat = !!selectedBlock && !!focusedBlockId;
+              const enableFormat = !!selectedBlock;
               void formatTick; // re-read state on selection change
+
+              let isBold = !!selectedBlock?.bold;
+              let isItalic = !!selectedBlock?.italic;
+              let isUnderline = !!selectedBlock?.underlined;
+              let isStrike = !!selectedBlock?.strikethrough;
+              let currentFontName = selectedBlock?.fontFamily || "";
+              let currentFontSize = selectedBlock?.cssFontSize ? selectedBlock.cssFontSize * (72 / 96) : 16;
+              let isMixedBold = false, isMixedItalic = false, isMixedUnderline = false, isMixedStrike = false, isMixedFont = false, isMixedFontSize = false;
+
+              if (selectedBlock?.html) {
+                const runs = parseRichRuns(selectedBlock.html, {
+                  bold: isBold, italic: isItalic, underlined: isUnderline, strikethrough: isStrike,
+                  color: selectedBlock.color, fontFamily: selectedBlock.fontFamily, baseCssFontSize: selectedBlock.cssFontSize
+                });
+                if (runs.length > 0) {
+                  isBold = runs[0].bold;
+                  isItalic = runs[0].italic;
+                  isUnderline = runs[0].underlined;
+                  isStrike = runs[0].strikethrough;
+                  currentFontName = runs[0].fontFamily || "";
+                  currentFontSize = (runs[0].fontSizeRatio || 1) * (selectedBlock.cssFontSize * (72 / 96));
+                  for (let i = 1; i < runs.length; i++) {
+                    if (runs[i].bold !== isBold) isMixedBold = true;
+                    if (runs[i].italic !== isItalic) isMixedItalic = true;
+                    if (runs[i].underlined !== isUnderline) isMixedUnderline = true;
+                    if (runs[i].strikethrough !== isStrike) isMixedStrike = true;
+                    if (runs[i].fontFamily !== currentFontName) isMixedFont = true;
+                    if (Math.abs((runs[i].fontSizeRatio || 1) * (selectedBlock.cssFontSize * (72 / 96)) - currentFontSize) > 0.1) isMixedFontSize = true;
+                  }
+                }
+              }
+
               const q = (cmd: string) => {
-                if (!enableFormat || typeof document === "undefined") return false;
+                if (!enableFormat) return false;
+                if (tool !== "edit-text") {
+                  if (cmd === "bold") return isMixedBold ? false : isBold;
+                  if (cmd === "italic") return isMixedItalic ? false : isItalic;
+                  if (cmd === "underline") return isMixedUnderline ? false : isUnderline;
+                  if (cmd === "strikeThrough") return isMixedStrike ? false : isStrike;
+                  return false;
+                }
+                if (typeof document === "undefined") return false;
                 try {
                   return document.queryCommandState(cmd);
                 } catch {
                   return false;
                 }
               };
-              let currentFontName = "";
-              if (enableFormat && typeof document !== "undefined") {
+              if (tool === "edit-text" && enableFormat && typeof document !== "undefined") {
                 try {
                   currentFontName = (document.queryCommandValue("fontName") || "")
                     .toString()
                     .replace(/^['"]|['"]$/g, "");
+                  const sz = parseFloat(document.queryCommandValue("fontSize") as string);
+                  if (sz > 0) currentFontSize = sz;
                 } catch {
                   /* ignore */
                 }
+              } else {
+                if (isMixedFont) currentFontName = "";
               }
               return (
                 <div
@@ -1512,22 +1969,21 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
                     min={1}
                     max={400}
                     step={0.5}
-                    defaultValue={
-                      selectedBlock
-                        ? Math.round((selectedBlock.pdfFontHeight ?? 0) * 10) / 10
-                        : ""
-                    }
-                    key={selected ? `${selected.itemId}` : "none"}
+                    value={isMixedFontSize ? "" : Math.round(currentFontSize * 10) / 10}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (v > 0) setSelectedFontSize(v);
+                    }}
+                    onBlur={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (v > 0) setSelectedFontSize(v);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
                         e.preventDefault();
-                        const n = Number((e.target as HTMLInputElement).value);
-                        if (Number.isFinite(n)) setSelectedFontSize(n);
+                        const v = parseFloat(e.currentTarget.value);
+                        if (v > 0) setSelectedFontSize(v);
                       }
-                    }}
-                    onBlur={(e) => {
-                      const n = Number(e.target.value);
-                      if (Number.isFinite(n)) setSelectedFontSize(n);
                     }}
                     disabled={!enableFormat}
                     title="Font size (pt) — applies to selected text"
@@ -1545,6 +2001,118 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
                     className="h-8 w-9 rounded-md border border-border disabled:cursor-not-allowed disabled:opacity-50"
                   />
                 </div>
+              );
+            })()}
+            {(() => {
+              const selectedOverlay =
+                selected?.kind === "overlay"
+                  ? pages[selected.pageIdx]?.overlays.find((o) => o.id === selected.itemId)
+                  : null;
+
+              const isImageSelected =
+                (selectedOverlay?.type === "image") ||
+                (selected?.kind === "inline-image");
+              
+              if (!isImageSelected) return null;
+
+              const wrapMode = selected?.kind === "inline-image" ? "inline" : (selectedOverlay?.type === "image" ? normalizeImageWrapMode((selectedOverlay as ImageOverlay).wrapMode) : "front");
+
+              const handleWrapModeChange = (mode: ImageWrapMode) => {
+                if (selected!.kind === "inline-image") {
+                  if (mode === "inline") return;
+                  convertInlineToFloating(selected!.pageIdx, selected!.itemId, selected!.extra!.src, mode);
+                } else {
+                  if (mode === "inline") {
+                    convertFloatingToInline(selected!.pageIdx, selected!.itemId);
+                  } else {
+                    updateOverlay(selected!.pageIdx, selected!.itemId, { wrapMode: mode });
+                  }
+                }
+              };
+
+              return (
+                <>
+                  <div className="mx-1 h-6 w-px bg-border sm:mx-2" />
+                  <div className="flex items-center gap-1 sm:gap-1.5">
+                    <Button
+                      type="button"
+                      variant={wrapMode === "inline" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="In Line with Text"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("inline")}
+                    >
+                      <WrapInlineIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "square" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="Square"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("square")}
+                    >
+                      <WrapSquareIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "tight" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="Tight"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("tight")}
+                    >
+                      <WrapTightIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "through" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="Through"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("through")}
+                    >
+                      <WrapThroughIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "top-bottom" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="Top and Bottom"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("top-bottom")}
+                    >
+                      <WrapTopBottomIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "behind" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="Behind Text"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("behind")}
+                    >
+                      <WrapBehindIcon className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={wrapMode === "front" ? "default" : "outline"}
+                      size="icon"
+                      className="h-8 w-8"
+                      title="In Front of Text"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleWrapModeChange("front")}
+                    >
+                      <WrapFrontIcon className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </>
               );
             })()}
             <div className="ml-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
@@ -1709,11 +2277,20 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
                     key={b.id}
                     block={b}
                     pageIdx={pageIdx}
+                    wrapZones={pageWrapZones}
                     tool={tool}
                     selected={isSelected}
                     edited={isBlockEdited(b)}
+                    selectedInlineImgSrc={
+                      selected?.kind === "inline-image" && selected.itemId === b.id
+                        ? selected.extra?.src
+                        : undefined
+                    }
                     onHtmlChange={(html) =>
                       updateBlock(pageIdx, b.id, { html, text: htmlToPlainText(html) })
+                    }
+                    onHeightChange={(cssH) =>
+                      updateBlock(pageIdx, b.id, { cssH })
                     }
                     onSelect={() =>
                       setSelected({ pageIdx, itemId: b.id, kind: "block" })
@@ -1856,8 +2433,8 @@ function FormatToggle({
         disabled
           ? "cursor-not-allowed border-transparent text-muted-foreground/60"
           : active
-          ? "border-primary bg-primary text-primary-foreground"
-          : "border-border bg-white hover:bg-muted",
+            ? "border-primary bg-primary text-primary-foreground"
+            : "border-border bg-white hover:bg-muted",
         className
       )}
     >
@@ -1976,23 +2553,80 @@ function overlayBBox(o: Overlay): BBox {
   return { x: o.x, y: o.y, w: o.w, h: o.h };
 }
 
+function findClosestBlockId(page: PageEntry, x: number, y: number): string | undefined {
+  let bestBlockId: string | undefined = undefined;
+  let minDistance = Infinity;
+  for (const b of page.blocks) {
+    if (b.deleted) continue;
+    const blockCenterX = b.cssX + b.cssW / 2;
+    const blockCenterY = b.cssY + b.cssH / 2;
+    const dist = Math.hypot(blockCenterX - x, blockCenterY - y);
+    if (dist < minDistance) {
+      minDistance = dist;
+      bestBlockId = b.id;
+    }
+  }
+  return bestBlockId;
+}
+
+function convertImageToPng(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas.toDataURL("image/png"));
+      } catch (e) {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => {
+      resolve(dataUrl);
+    };
+    img.src = dataUrl;
+  });
+}
+
+function pdfBytesToBlob(bytes: Uint8Array): Blob {
+  const body = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+  return new Blob([body], { type: "application/pdf" });
+}
+
 function BlockEditor({
   block,
   pageIdx,
+  wrapZones = [],
   tool,
   selected,
   edited,
+  selectedInlineImgSrc,
   onHtmlChange,
+  onHeightChange,
   onSelect,
   onStartDrag,
   registerFocused,
 }: {
   block: TextBlock;
   pageIdx: number;
+  wrapZones?: { x: number; y: number; w: number; h: number; mode: TextWrapMode; dataUrl?: string }[];
   tool: WorkspaceTool;
   selected: boolean;
   edited: boolean;
+  selectedInlineImgSrc?: string;
   onHtmlChange: (html: string) => void;
+  onHeightChange?: (cssH: number) => void;
   onSelect: () => void;
   onStartDrag: (e: React.PointerEvent, mode: "move" | "resize") => void;
   registerFocused: (el: HTMLDivElement | null) => void;
@@ -2000,9 +2634,7 @@ function BlockEditor({
   const moving = tool === "move";
   const editorRef = useRef<HTMLDivElement>(null);
 
-  // Seed the contentEditable once per block instance. The element is uncontrolled
-  // thereafter — typing/exec commands write directly into the DOM, and we sync
-  // state on input. (BlockEditor remounts when block.id changes via the key.)
+  // Sync state HTML to DOM when not focused or when changed from outside (undo/redo, format, inline image change)
   useEffect(() => {
     const el = editorRef.current;
     if (!el) return;
@@ -2010,8 +2642,158 @@ function BlockEditor({
     if (el.innerHTML !== initial) {
       el.innerHTML = initial;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [block.html]);
+
+  // Keep height of the text block synchronized with its scrollHeight to avoid layout overflow/clipping
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el || !onHeightChange) return;
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const currentHeight = Math.ceil(el.scrollHeight);
+        // Avoid infinite updates if the difference is negligible
+        if (Math.abs(currentHeight - block.cssH) > 1) {
+          onHeightChange(currentHeight);
+        }
+      }
+    });
+
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+    };
+  }, [block.cssH, onHeightChange]);
+
+  const intersectingZones = useMemo(() => {
+    return wrapZones.filter((z) => {
+      const relX = z.x - block.cssX;
+      const relY = z.y - block.cssY;
+      return relX < block.cssW && relX + z.w > 0 && relY < block.cssH && relY + z.h > 0;
+    });
+  }, [wrapZones, block.cssX, block.cssY, block.cssW, block.cssH]);
+
+  const renderedSpacers = useMemo(() => {
+    return intersectingZones.flatMap((z, idx) => {
+      const relX = z.x - block.cssX;
+      const relY = z.y - block.cssY;
+      const M = wrapMarginForMode(z.mode);
+
+      if (z.mode === "top-bottom") {
+        const zoneTop = relY - M;
+        const topSpacerHeight = Math.max(0, zoneTop);
+        const wrapHeight = Math.max(0, z.h + M * 2 + Math.min(0, zoneTop));
+        if (topSpacerHeight > 0) {
+          return [
+            <div
+              key={`tb-top-${idx}`}
+              contentEditable={false}
+              style={{
+                float: "left",
+                width: "0px",
+                height: `${topSpacerHeight}px`,
+                pointerEvents: "none",
+              }}
+            />,
+            <div
+              key={`tb-wrap-${idx}`}
+              contentEditable={false}
+              style={{
+                float: "left",
+                clear: "both",
+                width: "100%",
+                height: `${wrapHeight}px`,
+                pointerEvents: "none",
+              }}
+            />
+          ];
+        } else {
+          return [
+            <div
+              key={`tb-wrap-${idx}`}
+              contentEditable={false}
+              style={{
+                float: "left",
+                clear: "both",
+                width: "100%",
+                height: `${wrapHeight}px`,
+                pointerEvents: "none",
+              }}
+            />
+          ];
+        }
+      } else if (z.mode === "square" || z.mode === "tight" || z.mode === "through") {
+        const blockCenter = block.cssW / 2;
+        const imageCenter = relX + z.w / 2;
+        const isLeft = imageCenter <= blockCenter;
+        const floatSide = isLeft ? "left" : "right";
+        const edgeOffset = isLeft
+          ? Math.max(0, relX)
+          : Math.max(0, block.cssW - relX - z.w);
+        const offsetStyle: CSSProperties = isLeft
+          ? { marginLeft: edgeOffset }
+          : { marginRight: edgeOffset };
+        const shapeStyle: CSSProperties =
+          (z.mode === "tight" || z.mode === "through") && z.dataUrl
+            ? {
+              shapeOutside: `url("${z.dataUrl.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}")`,
+              shapeImageThreshold: z.mode === "through" ? 0.45 : 0.12,
+              shapeMargin: `${M}px`,
+            }
+            : {
+              shapeOutside: "inset(0px)",
+              shapeMargin: `${M}px`,
+            };
+        const topSpacerHeight = Math.max(0, relY - M);
+        const wrapHeight = Math.max(0, z.h + Math.min(0, relY));
+        const wrapWidth = Math.max(1, Math.min(z.w, block.cssW));
+
+        if (topSpacerHeight > 0) {
+          return [
+            <div
+              key={`sq-top-${idx}`}
+              contentEditable={false}
+              style={{
+                float: floatSide,
+                width: "0px",
+                height: `${topSpacerHeight}px`,
+                pointerEvents: "none",
+              }}
+            />,
+            <div
+              key={`sq-wrap-${idx}`}
+              contentEditable={false}
+              style={{
+                float: floatSide,
+                clear: floatSide,
+                width: `${wrapWidth}px`,
+                height: `${wrapHeight}px`,
+                pointerEvents: "none",
+                ...offsetStyle,
+                ...shapeStyle,
+              }}
+            />
+          ];
+        } else {
+          return [
+            <div
+              key={`sq-wrap-${idx}`}
+              contentEditable={false}
+              style={{
+                float: floatSide,
+                width: `${wrapWidth}px`,
+                height: `${wrapHeight}px`,
+                pointerEvents: "none",
+                ...offsetStyle,
+                ...shapeStyle,
+              }}
+            />
+          ];
+        }
+      }
+      return [];
+    });
+  }, [intersectingZones, block.cssW, block.cssX, block.cssY]);
 
   return (
     <div
@@ -2035,6 +2817,17 @@ function BlockEditor({
         height: Math.max(block.cssH, block.cssFontSize * 1.2),
       }}
     >
+      {selectedInlineImgSrc && (
+        <style>{`
+          [data-block-id="${block.id}"] img[src="${selectedInlineImgSrc.replace(/"/g, '\\"')}"] {
+            outline: 3px solid #3b82f6 !important;
+            outline-offset: 1px;
+          }
+        `}</style>
+      )}
+
+      {renderedSpacers}
+
       <div
         ref={editorRef}
         data-block-id={block.id}
@@ -2047,17 +2840,18 @@ function BlockEditor({
           registerFocused(editorRef.current);
         }}
         onBlur={() => {
-          // Keep focused ref pointing here until another block focuses, so toolbar
-          // exec works when the user clicks a button (which itself prevents focus).
+          // Keep focused ref pointing here until another block focuses
         }}
-        onInput={(e) => onHtmlChange((e.currentTarget as HTMLDivElement).innerHTML)}
+        onInput={(e) => {
+          const html = (e.currentTarget as HTMLDivElement).innerHTML;
+          onHtmlChange(html);
+        }}
         onPointerDown={(e) => {
           if (moving) return;
           e.stopPropagation();
         }}
         className={cn(
-          "absolute inset-0 block w-full overflow-hidden border-none bg-transparent p-0 leading-tight outline-none",
-          edited && "bg-amber-50/70",
+          "block w-full min-h-full border-none bg-transparent p-0 leading-tight outline-none",
           moving && "pointer-events-none select-none"
         )}
         style={{
@@ -2066,8 +2860,8 @@ function BlockEditor({
           fontFamily: block.cssFontFamily ?? block.fontFamily ?? "inherit",
           color: block.color
             ? `rgb(${Math.round(block.color.r * 255)}, ${Math.round(
-                block.color.g * 255
-              )}, ${Math.round(block.color.b * 255)})`
+              block.color.g * 255
+            )}, ${Math.round(block.color.b * 255)})`
             : "#0f172a",
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
@@ -2134,12 +2928,23 @@ function OverlayItem({
   }
 
   if (overlay.type === "image") {
+    const wm = normalizeImageWrapMode(overlay.wrapMode);
+    if (wm === "inline") return null;
+    const zIndex = wm === "behind" ? -1 : (wm === "front") ? 10 : 5;
     return (
       <div
         onClick={handleSelect}
         onPointerDown={handlePointerDown}
         className={common}
-        style={{ left: overlay.x, top: overlay.y, width: overlay.w, height: overlay.h }}
+        style={{
+          left: overlay.x,
+          top: overlay.y,
+          width: overlay.w,
+          height: overlay.h,
+          zIndex,
+          // Allow clicking through to text underneath when image is behind text
+          pointerEvents: wm === "behind" && !selected && tool !== "move" ? "none" : undefined,
+        }}
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img

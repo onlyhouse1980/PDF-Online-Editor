@@ -1,0 +1,10 @@
+--- lib/overlays.ts
++++ lib/overlays.ts
+@@ -10,6 +10,7 @@
+       y: number;
+       w: number;
+       h: number;
++      wrapMode?: "front" | "back" | "wrap-left" | "wrap-right" | "jump";
+     }
+   | {
+       id: string;

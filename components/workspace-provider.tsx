@@ -13,6 +13,7 @@ import {
 import type { PDFDocumentProxy } from "@/lib/pdfjs";
 import type { ExtractedFont } from "@/lib/font-extract";
 import type { TextBlock } from "@/lib/group-runs";
+import type { ImageWrapMode } from "@/lib/image-wrap";
 import { useCallback, useEffect } from "react";
 
 export interface BaseOverlay {
@@ -35,9 +36,11 @@ export interface InkOverlay extends BaseOverlay {
 }
 export interface ImageOverlay extends BaseOverlay {
   type: "image";
+  dataUrl: string;
   w: number;
   h: number;
-  dataUrl: string;
+  wrapMode?: ImageWrapMode;
+  anchorBlockId?: string;
 }
 export type Overlay = HighlightOverlay | InkOverlay | ImageOverlay;
 
@@ -64,7 +67,8 @@ export interface PageEntry {
 export interface Selection {
   pageIdx: number;
   itemId: string;
-  kind: "block" | "overlay";
+  kind: "block" | "overlay" | "inline-image";
+  extra?: { src: string };
 }
 
 interface WorkspaceContextValue {
@@ -98,6 +102,7 @@ interface WorkspaceContextValue {
   redo: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  undoTick: number;
 }
 
 const Ctx = createContext<WorkspaceContextValue | null>(null);
@@ -128,64 +133,67 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     extractedFontsRef.current = new Map();
     fontFamilyMapRef.current = new Map();
     pageBitmapsRef.current = new Map();
-    setHistory([]);
-    setHistoryIndex(-1);
+    setHistory({ stack: [], index: -1 });
+    setUndoTick(0);
   }
 
-  const [history, setHistory] = useState<PageEntry[][]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [history, setHistory] = useState<{ stack: PageEntry[][]; index: number }>({
+    stack: [],
+    index: -1,
+  });
+  const [undoTick, setUndoTick] = useState(0);
 
   // Initialize history on first load
   useEffect(() => {
-    if (pages.length > 0 && history.length === 0) {
-      setHistory([pages]);
-      setHistoryIndex(0);
+    if (pages.length > 0 && history.stack.length === 0) {
+      setHistory({ stack: [pages], index: 0 });
     }
-  }, [pages, history.length]);
+  }, [pages, history.stack.length]);
 
   // Debounced history commit for subsequent edits
   useEffect(() => {
-    if (pages.length === 0 || history.length === 0) return;
+    if (pages.length === 0 || history.stack.length === 0) return;
     // Don't commit if this state is the result of an undo/redo
-    if (history[historyIndex] === pages) return;
+    if (history.stack[history.index] === pages) return;
 
     const timer = setTimeout(() => {
       setHistory((prev) => {
-        const newHistory = prev.slice(0, historyIndex + 1);
+        const newStack = prev.stack.slice(0, prev.index + 1);
         // Avoid duplicate commits
-        if (newHistory.length > 0 && newHistory[newHistory.length - 1] === pages) {
-          return newHistory;
+        if (newStack.length > 0 && newStack[newStack.length - 1] === pages) {
+          return prev;
         }
-        newHistory.push(pages);
-        if (newHistory.length > 11) newHistory.shift();
-        return newHistory;
+        newStack.push(pages);
+        if (newStack.length > 11) newStack.shift();
+        return { stack: newStack, index: newStack.length - 1 };
       });
-      setHistoryIndex((prev) => Math.min(prev + 1, 10));
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [pages, history, historyIndex]);
+  }, [pages, history.stack, history.index]);
 
   const undo = useCallback(() => {
-    if (historyIndex > 0) {
-      const newIndex = historyIndex - 1;
-      setHistoryIndex(newIndex);
-      setPages(history[newIndex]);
+    if (history.index > 0) {
+      const newIndex = history.index - 1;
+      setHistory((prev) => ({ ...prev, index: newIndex }));
+      setPages(history.stack[newIndex]);
       setSelected(null);
+      setUndoTick((t) => (t + 1) & 0xffff);
     }
-  }, [historyIndex, history]);
+  }, [history.index, history.stack, setHistory, setPages, setSelected, setUndoTick]);
 
   const redo = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      const newIndex = historyIndex + 1;
-      setHistoryIndex(newIndex);
-      setPages(history[newIndex]);
+    if (history.index < history.stack.length - 1) {
+      const newIndex = history.index + 1;
+      setHistory((prev) => ({ ...prev, index: newIndex }));
+      setPages(history.stack[newIndex]);
       setSelected(null);
+      setUndoTick((t) => (t + 1) & 0xffff);
     }
-  }, [historyIndex, history]);
+  }, [history.index, history.stack, setHistory, setPages, setSelected, setUndoTick]);
 
-  const canUndo = historyIndex > 0;
-  const canRedo = historyIndex < history.length - 1;
+  const canUndo = history.index > 0;
+  const canRedo = history.index < history.stack.length - 1;
 
   return (
     <Ctx.Provider
@@ -220,6 +228,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         redo,
         canUndo,
         canRedo,
+        undoTick,
       }}
     >
       {children}

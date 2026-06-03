@@ -17,6 +17,11 @@ export interface RichRun {
   color?: RGB;
   fontFamily?: string;
   fontSizeRatio: number; // ratio of run font-size to block base font-size
+  image?: {
+    dataUrl: string;
+    w: number;
+    h: number;
+  };
 }
 
 export interface RichRunDefaults {
@@ -27,6 +32,7 @@ export interface RichRunDefaults {
   color?: RGB;
   fontFamily?: string;
   baseCssFontSize: number; // px — used to compute font-size ratios from inline px values
+  scaleRatio?: number;
 }
 
 export function escapeHtml(s: string): string {
@@ -178,6 +184,36 @@ export function parseRichRuns(html: string, defaults: RichRunDefaults): RichRun[
       return;
     }
 
+    if (tag === "img") {
+      const src = el.getAttribute("src") || "";
+      if (src) {
+        let w = parseFloat(el.getAttribute("width") || "");
+        let h = parseFloat(el.getAttribute("height") || "");
+        
+        if (!w || !h) {
+          const styleW = el.style.width;
+          const styleH = el.style.height;
+          if (styleW) w = parseFloat(styleW);
+          if (styleH) h = parseFloat(styleH);
+        }
+        
+        if (!w) w = 100;
+        if (!h) h = 100;
+
+        const scale = defaults.scaleRatio || 1.7;
+        runs.push({
+          ...ctx,
+          text: "",
+          image: {
+            dataUrl: src,
+            w: w / scale,
+            h: h / scale,
+          }
+        });
+      }
+      return;
+    }
+
     const newCtx: RichRun = { ...ctx };
 
     if (tag === "b" || tag === "strong") newCtx.bold = true;
@@ -251,6 +287,10 @@ export function parseRichRuns(html: string, defaults: RichRunDefaults): RichRun[
   // Merge adjacent runs with identical style.
   const merged: RichRun[] = [];
   for (const r of runs) {
+    if (r.image) {
+      merged.push({ ...r });
+      continue;
+    }
     if (r.text.length === 0) continue;
     const last = merged[merged.length - 1];
     if (last && sameStyle(last, r)) last.text += r.text;
@@ -269,6 +309,9 @@ export interface LineSegment {
 export interface LaidOutLine {
   segments: LineSegment[];
   ascentPt: number; // max ascender on the line for line-height
+  offsetX?: number;
+  topPt: number;
+  heightPt: number;
 }
 
 export interface LayoutResult {
@@ -284,30 +327,121 @@ function widthOf(font: PDFFont, text: string, size: number): number {
   }
 }
 
+export interface WrapZone {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  mode: "square" | "tight" | "through" | "top-bottom";
+  dataUrl?: string;
+}
+
+function isSideWrapMode(mode: WrapZone["mode"]): boolean {
+  return mode === "square" || mode === "tight" || mode === "through";
+}
+
+function applySideWrapZone(
+  z: WrapZone,
+  maxWidthPt: number,
+  startX: number,
+  maxW: number
+): { startX: number; maxW: number } {
+  const leftWidth = Math.max(0, z.x);
+  const rightEdgeOfZone = z.x + z.w;
+  const rightWidth = Math.max(0, maxWidthPt - rightEdgeOfZone);
+
+  if (rightWidth >= leftWidth) {
+    return { startX: Math.max(startX, rightEdgeOfZone), maxW };
+  }
+  return { startX, maxW: Math.min(maxW, z.x) };
+}
+
 export function layoutRichRuns(
   runs: RichRun[],
   maxWidthPt: number,
   baseFontSizePt: number,
   baseLineHeightPt: number,
-  resolveFont: (run: RichRun) => PDFFont
+  resolveFont: (run: RichRun) => PDFFont,
+  wrapZones?: WrapZone[]
 ): LayoutResult {
-  const lines: LaidOutLine[] = [{ segments: [], ascentPt: baseFontSizePt }];
+  const lines: LaidOutLine[] = [
+    { segments: [], ascentPt: baseFontSizePt, offsetX: 0, topPt: 0, heightPt: baseLineHeightPt }
+  ];
+  let currentTop = 0;
   let lineWidth = 0;
 
   function pushSegment(seg: LineSegment) {
-    lines[lines.length - 1].segments.push(seg);
-    lines[lines.length - 1].ascentPt = Math.max(
-      lines[lines.length - 1].ascentPt,
-      seg.fontSizePt
-    );
+    const line = lines[lines.length - 1];
+    line.segments.push(seg);
+    line.ascentPt = Math.max(line.ascentPt, seg.fontSizePt);
+    line.heightPt = Math.max(baseLineHeightPt, line.ascentPt * 1.2);
     lineWidth += seg.widthPt;
   }
   function newLine() {
-    lines.push({ segments: [], ascentPt: baseFontSizePt });
+    const prevLine = lines[lines.length - 1];
+    const prevHeight = prevLine ? prevLine.heightPt : baseLineHeightPt;
+    currentTop += prevHeight;
+    lines.push({
+      segments: [],
+      ascentPt: baseFontSizePt,
+      offsetX: 0,
+      topPt: currentTop,
+      heightPt: baseLineHeightPt
+    });
     lineWidth = 0;
   }
 
   for (const run of runs) {
+    if (run.image) {
+      const w = run.image.w;
+      const h = run.image.h;
+      const lineIdx = lines.length - 1;
+
+      if (lineWidth + w > maxWidthPt && lines[lineIdx].segments.length > 0) {
+        newLine();
+      }
+
+      const lineIdx2 = lines.length - 1;
+      let maxW = maxWidthPt;
+      let startX = 0;
+      const lineTop = lines[lineIdx2].topPt;
+      const lineBottom = lineTop + lines[lineIdx2].heightPt;
+      let jumped = false;
+
+      if (wrapZones) {
+        for (const z of wrapZones) {
+          if (lineBottom > z.y && lineTop < z.y + z.h) {
+            if (z.mode === "top-bottom") {
+              const zoneBottom = z.y + z.h;
+              while (lines[lines.length - 1].topPt < zoneBottom) {
+                newLine();
+              }
+              jumped = true;
+              break;
+            } else if (isSideWrapMode(z.mode)) {
+              ({ startX, maxW } = applySideWrapZone(z, maxWidthPt, startX, maxW));
+            }
+          }
+        }
+      }
+
+      if (jumped) {
+        const newLineIdx = lines.length - 1;
+        lines[newLineIdx].offsetX = startX;
+      } else {
+        lines[lineIdx2].offsetX = startX;
+      }
+
+      pushSegment({
+        run,
+        text: "",
+        widthPt: w,
+        fontSizePt: h,
+        font: resolveFont(run),
+      });
+      continue;
+    }
+
     const fontSize = baseFontSizePt * (run.fontSizeRatio || 1);
     const font = resolveFont(run);
     const segments = run.text.split("\n");
@@ -319,23 +453,59 @@ export function layoutRichRuns(
       for (const tok of tokens) {
         const w = widthOf(font, tok, fontSize);
         const isSpace = /^\s+$/.test(tok);
-        if (
-          !isSpace &&
-          lineWidth + w > maxWidthPt &&
-          lines[lines.length - 1].segments.length > 0
-        ) {
-          newLine();
+
+        let placed = false;
+        let safetyLimit = 500;
+        while (!placed && --safetyLimit > 0) {
+          const lineIdx = lines.length - 1;
+          const lineTop = lines[lineIdx].topPt;
+          const lineBottom = lineTop + lines[lineIdx].heightPt;
+
+          let maxW = maxWidthPt;
+          let startX = 0;
+          let jumped = false;
+
+          if (wrapZones) {
+            for (const z of wrapZones) {
+              if (lineBottom > z.y && lineTop < z.y + z.h) {
+                if (z.mode === "top-bottom") {
+                  const zoneBottom = z.y + z.h;
+                  while (lines[lines.length - 1].topPt < zoneBottom) {
+                    newLine();
+                  }
+                  jumped = true;
+                  break;
+                } else if (isSideWrapMode(z.mode)) {
+                  ({ startX, maxW } = applySideWrapZone(z, maxWidthPt, startX, maxW));
+                }
+              }
+            }
+          }
+
+          if (jumped) continue;
+
+          lines[lineIdx].offsetX = startX;
+          
+          if (!isSpace && startX + lineWidth + w > maxW && lines[lineIdx].segments.length > 0) {
+            newLine();
+            continue;
+          }
+          if (isSpace && lines[lineIdx].segments.length === 0) {
+            placed = true;
+            break;
+          }
+
+          pushSegment({ run, text: tok, widthPt: w, fontSizePt: fontSize, font });
+          placed = true;
         }
-        if (isSpace && lines[lines.length - 1].segments.length === 0) {
-          // skip leading whitespace on a new line
-          continue;
-        }
-        pushSegment({ run, text: tok, widthPt: w, fontSizePt: fontSize, font });
       }
     }
   }
 
   let total = 0;
-  for (const ln of lines) total += baseLineHeightPt;
+  if (lines.length > 0) {
+    const lastLine = lines[lines.length - 1];
+    total = lastLine.topPt + lastLine.heightPt;
+  }
   return { lines, totalHeightPt: total };
 }

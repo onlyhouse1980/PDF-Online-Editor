@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { buildGoogleFontsHref } from "@/lib/font-presets";
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { PwaRegistrar } from "@/components/pwa-registrar";
@@ -46,6 +47,12 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
+      <head>
+        {buildGoogleFontsHref() && (
+          // eslint-disable-next-line @next/next/no-page-custom-font
+          <link rel="stylesheet" href={buildGoogleFontsHref()} />
+        )}
+      </head>
       <body className="min-h-full flex flex-col">
         <PwaRegistrar />
         <WorkspaceProvider>

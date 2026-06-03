@@ -1,4 +1,3 @@
-"use client";
 
 export type FontCategory = "sans" | "serif" | "mono" | "display" | "handwriting";
 
