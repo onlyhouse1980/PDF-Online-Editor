@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <div id="editor" contenteditable="true">Select some text here.</div>
+  <input type="number" id="inp" placeholder="Type a number" />
+  <script>
+    const el = document.getElementById("editor");
+    const inp = document.getElementById("inp");
+    
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        el.focus();
+        const sel = window.getSelection();
+        if (sel.rangeCount > 0) {
+          const range = sel.getRangeAt(0);
+          const span = document.createElement("span");
+          span.style.fontSize = inp.value + "px";
+          range.surroundContents(span);
+        }
+      }
+    });
+  </script>
+</body>
+</html>

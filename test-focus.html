@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <div id="editor" contenteditable="true">Hello World, this is a test.</div>
+  <input type="number" id="inp" />
+  <script>
+    const el = document.getElementById("editor");
+    const inp = document.getElementById("inp");
+    
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        el.focus();
+        const sel = window.getSelection();
+        console.log("Range collapsed?", sel.getRangeAt(0).collapsed);
+        console.log("Text:", sel.getRangeAt(0).toString());
+      }
+    });
+  </script>
+</body>
+</html>

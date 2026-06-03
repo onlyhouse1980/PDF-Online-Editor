@@ -153,6 +153,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [formatTick, setFormatTick] = useState(0);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const lastSelectionRef = useRef<Range | null>(null);
 
   // Load curated Google Fonts so previews + editor render in chosen families.
   useEffect(() => {
@@ -170,6 +171,22 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   useEffect(() => {
     function onSelChange() {
       setFormatTick((t) => (t + 1) & 0xffff);
+      
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      let node: Node | null = range.commonAncestorContainer;
+      let inEditor = false;
+      while (node) {
+        if (node.nodeType === 1 && (node as HTMLElement).getAttribute?.("data-block-id")) {
+          inEditor = true;
+          break;
+        }
+        node = node.parentNode;
+      }
+      if (inEditor) {
+        lastSelectionRef.current = range.cloneRange();
+      }
     }
     document.addEventListener("selectionchange", onSelChange);
     return () => document.removeEventListener("selectionchange", onSelChange);
@@ -1314,14 +1331,12 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
   }
   function setSelectedFontSize(sizePt: number) {
     if (!Number.isFinite(sizePt) || sizePt < 1) return;
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0) return;
+    const range = lastSelectionRef.current;
+    if (!range || range.collapsed) return;
     execOnFocusedBlock(() => {
       // execCommand("fontSize") only takes 1-7. Use insertHTML with a wrapping
       // span at the requested px size instead.
-      const range = sel.getRangeAt(0);
       const sizePx = sizePt * (96 / 72);
-      if (range.collapsed) return; // no selection to size
       const span = document.createElement("span");
       span.style.fontSize = `${sizePx}px`;
       try {
@@ -1503,7 +1518,6 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
                         : ""
                     }
                     key={selected ? `${selected.itemId}` : "none"}
-                    onMouseDown={(e) => e.preventDefault()}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
                         e.preventDefault();
