@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <div id="editor" contenteditable="true">Hello World</div>
+  <script>
+    const el = document.getElementById("editor");
+    el.focus();
+    // No text selected! (selection is collapsed at start or end)
+    document.execCommand("fontName", false, "Permanent Marker");
+    console.log("HTML:", el.innerHTML);
+    
+    // Now let's try with text selected
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    
+    document.execCommand("fontName", false, "Permanent Marker");
+    console.log("HTML after selection:", el.innerHTML);
+  </script>
+</body>
+</html>

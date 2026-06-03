@@ -875,12 +875,12 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
           );
         }
       }
+      extractedFontsRef.current = extracted;
 
       const src = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
-      const fk = (fontkit as any).default || fontkit;
-      src.registerFontkit(fk);
+      src.registerFontkit(fontkit);
       const out = await PDFDocument.create();
-      out.registerFontkit(fk);
+      out.registerFontkit(fontkit);
 
       // 1. Gather all required custom Google Fonts from edited blocks
       const requiredGoogleFonts = new Map<string, Set<string>>(); // family -> Set("style|weight")

@@ -1,0 +1,224 @@
+diff --git a/components/pdf-workspace.tsx b/components/pdf-workspace.tsx
+index 43be7b0..b23f3d5 100644
+--- a/components/pdf-workspace.tsx
++++ b/components/pdf-workspace.tsx
+@@ -17,6 +17,11 @@ import {
+   Signature,
+   Trash2,
+   Type,
++  Undo2,
++  Redo2,
++  Eye,
++  Printer,
++  X,
+   ZoomIn,
+   ZoomOut,
+ } from "lucide-react";
+@@ -127,6 +132,10 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+     fontFamilyMapRef,
+     pageBitmapsRef,
+     reset,
++    undo,
++    redo,
++    canUndo,
++    canRedo,
+   } = useWorkspace();
+ 
+   const [tool, setTool] = useState<WorkspaceTool>(defaultTool);
+@@ -143,6 +152,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+   const focusedBlockRef = useRef<HTMLDivElement | null>(null);
+   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+   const [formatTick, setFormatTick] = useState(0);
++  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+ 
+   // Load curated Google Fonts so previews + editor render in chosen families.
+   useEffect(() => {
+@@ -713,6 +723,18 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+           target.tagName === "INPUT" ||
+           target.isContentEditable);
+       if (isEditing) return;
++
++      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
++        e.preventDefault();
++        undo();
++        return;
++      }
++      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "z") {
++        e.preventDefault();
++        redo();
++        return;
++      }
++
+       if ((e.key === "Delete" || e.key === "Backspace") && selected) {
+         e.preventDefault();
+         deleteSelected();
+@@ -723,7 +745,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+     window.addEventListener("keydown", onKey);
+     return () => window.removeEventListener("keydown", onKey);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [selected]);
++  }, [selected, undo, redo]);
+ 
+   function hexToRgb(hex: string) {
+     const m = /^#?([a-f0-9]{6})$/i.exec(hex.trim());
+@@ -821,6 +843,7 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+     if (b.text !== b.original) return true;
+     if (b.html !== undefined) {
+       if (b.originalHtml !== undefined && b.html !== b.originalHtml) return true;
++      if (b.originalHtml === undefined) return true;
+       const plain = htmlToPlainText(b.html);
+       if (plain !== b.original) return true;
+     }
+@@ -838,16 +861,13 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+     return false;
+   }
+ 
+-  async function save() {
+-    if (!file || !pdf) return;
+-    setBusy(true);
+-    setMissingFont([]);
+-    try {
+-      const extracted = new Map(extractedFontsRef.current);
+-      for (const pdata of pages) {
+-        if (pdata.origin.kind !== "source") continue;
+-        const page = await pdf.getPage(pdata.origin.srcIndex + 1);
+-        for (const block of pdata.blocks) {
++  async function generatePdfBytes(): Promise<Uint8Array | null> {
++    if (!file || !pdf) return null;
++    const extracted = new Map(extractedFontsRef.current);
++    for (const pdata of pages) {
++      if (pdata.origin.kind !== "source") continue;
++      const page = await pdf.getPage(pdata.origin.srcIndex + 1);
++      for (const block of pdata.blocks) {
+           if (!block.fontKey || extracted.has(block.fontKey)) continue;
+           extracted.set(
+             block.fontKey,
+@@ -857,9 +877,10 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+       }
+ 
+       const src = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
+-      src.registerFontkit(fontkit);
++      const fk = (fontkit as any).default || fontkit;
++      src.registerFontkit(fk);
+       const out = await PDFDocument.create();
+-      out.registerFontkit(fontkit);
++      out.registerFontkit(fk);
+ 
+       // 1. Gather all required custom Google Fonts from edited blocks
+       const requiredGoogleFonts = new Map<string, Set<string>>(); // family -> Set("style|weight")
+@@ -1168,9 +1189,57 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+       }
+ 
+       setMissingFont(Array.from(missing));
+-      const bytes = await out.save();
+-      const baseName = file.name.replace(/\.pdf$/i, "");
+-      downloadBlob(bytes, `${baseName}-edited.pdf`);
++      return await out.save();
++  }
++
++  async function save() {
++    if (!file || !pdf) return;
++    setBusy(true);
++    setMissingFont([]);
++    try {
++      const bytes = await generatePdfBytes();
++      if (bytes) {
++        const baseName = file.name.replace(/\.pdf$/i, "");
++        downloadBlob(bytes, `${baseName}-edited.pdf`);
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function handlePreview() {
++    if (!file || !pdf) return;
++    setBusy(true);
++    setMissingFont([]);
++    try {
++      const bytes = await generatePdfBytes();
++      if (bytes) {
++        const blob = new Blob([bytes as any], { type: "application/pdf" });
++        setPreviewUrl(URL.createObjectURL(blob));
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function handlePrint() {
++    if (!file || !pdf) return;
++    setBusy(true);
++    setMissingFont([]);
++    try {
++      const bytes = await generatePdfBytes();
++      if (bytes) {
++        const blob = new Blob([bytes as any], { type: "application/pdf" });
++        const url = URL.createObjectURL(blob);
++        const iframe = document.createElement("iframe");
++        iframe.style.display = "none";
++        iframe.src = url;
++        document.body.appendChild(iframe);
++        iframe.onload = () => {
++          iframe.contentWindow?.print();
++          // Optional cleanup: document.body.removeChild(iframe);
++        };
++      }
+     } finally {
+       setBusy(false);
+     }
+@@ -1465,6 +1534,14 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+               );
+             })()}
+             <div className="ml-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
++              <div className="flex items-center gap-1 mr-2 border-r pr-3">
++                <Button size="icon" variant="ghost" onClick={undo} disabled={!canUndo} title="Undo (Cmd+Z)" aria-label="Undo">
++                  <Undo2 className="h-4 w-4" />
++                </Button>
++                <Button size="icon" variant="ghost" onClick={redo} disabled={!canRedo} title="Redo (Cmd+Shift+Z)" aria-label="Redo">
++                  <Redo2 className="h-4 w-4" />
++                </Button>
++              </div>
+               <Button
+                 size="sm"
+                 variant="outline"
+@@ -1507,6 +1584,15 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+                 <Trash2 className="h-4 w-4" />
+                 <span className="hidden sm:inline">Delete item</span>
+               </Button>
++              <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
++              <Button size="sm" variant="outline" onClick={handlePreview} disabled={busy} title="Preview PDF" aria-label="Preview PDF">
++                <Eye className="h-4 w-4 sm:mr-1" />
++                <span className="hidden sm:inline">Preview</span>
++              </Button>
++              <Button size="sm" variant="outline" onClick={handlePrint} disabled={busy} title="Print PDF" aria-label="Print PDF">
++                <Printer className="h-4 w-4 sm:mr-1" />
++                <span className="hidden sm:inline">Print</span>
++              </Button>
+               <Button size="sm" onClick={save} disabled={busy} title="Save PDF" aria-label="Save PDF">
+                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                 <span>Save</span>
+@@ -1706,6 +1792,23 @@ export function PdfWorkspace({ defaultTool = "move", hint }: Props) {
+       {signatureOpen && (
+         <SignaturePad onClose={() => setSignatureOpen(false)} onConfirm={addSignature} />
+       )}
++
++      {/* Preview Modal */}
++      {previewUrl && (
++        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
++          <div className="relative flex h-[90vh] w-full max-w-5xl flex-col rounded-lg bg-white shadow-2xl">
++            <div className="flex items-center justify-between border-b px-4 py-3">
++              <h2 className="text-lg font-semibold">PDF Preview</h2>
++              <Button size="icon" variant="ghost" onClick={() => setPreviewUrl(null)}>
++                <X className="h-5 w-5" />
++              </Button>
++            </div>
++            <div className="flex-1 overflow-hidden bg-slate-100 p-2 sm:p-4">
++              <iframe src={previewUrl} className="h-full w-full rounded border bg-white shadow-sm" />
++            </div>
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
