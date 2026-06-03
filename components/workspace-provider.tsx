@@ -13,6 +13,7 @@ import {
 import type { PDFDocumentProxy } from "@/lib/pdfjs";
 import type { ExtractedFont } from "@/lib/font-extract";
 import type { TextBlock } from "@/lib/group-runs";
+import { useCallback, useEffect } from "react";
 
 export interface BaseOverlay {
   id: string;
@@ -93,6 +94,10 @@ interface WorkspaceContextValue {
   fontFamilyMapRef: RefObject<Map<string, string>>;
   pageBitmapsRef: RefObject<Map<string, HTMLCanvasElement>>;
   reset: () => void;
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 const Ctx = createContext<WorkspaceContextValue | null>(null);
@@ -123,7 +128,64 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     extractedFontsRef.current = new Map();
     fontFamilyMapRef.current = new Map();
     pageBitmapsRef.current = new Map();
+    setHistory([]);
+    setHistoryIndex(-1);
   }
+
+  const [history, setHistory] = useState<PageEntry[][]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+
+  // Initialize history on first load
+  useEffect(() => {
+    if (pages.length > 0 && history.length === 0) {
+      setHistory([pages]);
+      setHistoryIndex(0);
+    }
+  }, [pages, history.length]);
+
+  // Debounced history commit for subsequent edits
+  useEffect(() => {
+    if (pages.length === 0 || history.length === 0) return;
+    // Don't commit if this state is the result of an undo/redo
+    if (history[historyIndex] === pages) return;
+
+    const timer = setTimeout(() => {
+      setHistory((prev) => {
+        const newHistory = prev.slice(0, historyIndex + 1);
+        // Avoid duplicate commits
+        if (newHistory.length > 0 && newHistory[newHistory.length - 1] === pages) {
+          return newHistory;
+        }
+        newHistory.push(pages);
+        if (newHistory.length > 11) newHistory.shift();
+        return newHistory;
+      });
+      setHistoryIndex((prev) => Math.min(prev + 1, 10));
+    }, 500); // 500ms debounce
+
+    return () => clearTimeout(timer);
+  }, [pages, history, historyIndex]);
+
+  const undo = useCallback(() => {
+    if (historyIndex > 0) {
+      const newIndex = historyIndex - 1;
+      setHistoryIndex(newIndex);
+      setPages(history[newIndex]);
+      setSelected(null);
+    }
+  }, [historyIndex, history]);
+
+  const redo = useCallback(() => {
+    if (historyIndex < history.length - 1) {
+      const newIndex = historyIndex + 1;
+      setHistoryIndex(newIndex);
+      setPages(history[newIndex]);
+      setSelected(null);
+    }
+  }, [historyIndex, history]);
+
+  const canUndo = historyIndex > 0;
+  const canRedo = historyIndex < history.length - 1;
 
   return (
     <Ctx.Provider
@@ -154,6 +216,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         fontFamilyMapRef,
         pageBitmapsRef,
         reset,
+        undo,
+        redo,
+        canUndo,
+        canRedo,
       }}
     >
       {children}

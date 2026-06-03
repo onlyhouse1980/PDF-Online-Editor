@@ -96,6 +96,8 @@ export function findPresetByFamily(family: string): FontPreset | undefined {
     .split(",")[0]
     .trim()
     .replace(/^['"]|['"]$/g, "")
+    .replace(/^&quot;|&quot;$/g, "")
+    .replace(/^&#39;|&#39;$/g, "")
     .toLowerCase();
   return FONT_PRESETS.find((p) => p.name.toLowerCase() === cleaned);
 }

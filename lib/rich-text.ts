@@ -130,7 +130,9 @@ function primaryFamily(family: string): string {
   return family
     .split(",")[0]
     .trim()
-    .replace(/^['"]|['"]$/g, "");
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/^&quot;|&quot;$/g, "")
+    .replace(/^&#39;|&#39;$/g, "");
 }
 
 function sameStyle(a: RichRun, b: RichRun): boolean {

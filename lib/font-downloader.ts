@@ -13,7 +13,7 @@ export async function fetchGoogleFontUrls(family: string): Promise<FontFile[]> {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 
-  const url = `https://gwfh.mranftl.com/api/fonts/${id}`;
+  const url = `/api/fonts?family=${id}`;
 
   const res = await fetch(url);
   if (!res.ok) {
